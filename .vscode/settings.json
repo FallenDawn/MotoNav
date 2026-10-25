@@ -1,0 +1,7 @@
+{
+  "platformio-ide.autoRebuildAutocompleteIndex": true,
+  "files.associations": {
+    "*.cpp": "cpp",
+    "*.hpp": "cpp"
+  }
+}

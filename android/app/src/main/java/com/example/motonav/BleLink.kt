@@ -1,0 +1,953 @@
+package com.example.motonav
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothGattDescriptor
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.ParcelUuid
+import android.os.SystemClock
+import java.util.UUID
+
+/**
+ * 版本：跟随 App 版本，见 MainActivity.kt 里的 APP_VERSION（当前 v5.7；v5.7 显示底图用时；v4.6 请求蓝牙 2M 模式、统计实际传输速度；v5.5 图片栏扩到 8 个，修复天气页闪退）
+ *
+ * 负责搜索圆屏、连接、发送指令（和圆屏固件里的名字、UUID 一一对应）。
+ *
+ * 发送机制（v1.7 重写）：
+ * - 所有消息进一个发送队列，同一时间只有一条在路上，发完立刻发下一条。
+ * - 同类状态消息（导航、车速、测速、车道、亮度）在队列里只保留最新一条，旧的直接被替换，
+ *   所以圆屏永远收到最新数据，不会积压。
+ * - 文字图片（路名、底部信息）按大数据包分片，每一片都必须送达，不会被替换。
+ * - 连上后协商大数据包（MTU 517），重连后自动补发最近的全部状态和图片。
+ * - 自动连接、锁屏也能重连、每 2 秒心跳（v1.3 起）。
+ * - v2.0 新增“大块数据”通道（地图块、导航路线，几十 KB）：单独排队，优先级低于导航等状态消息；
+ *   订阅圆屏的通知通道，圆屏收齐一份大块数据后会回 "K,类型,编号"。
+ * - v6.4 配对验证（配合固件 v6.5）：第一次连接时手机弹出配对框，输入圆屏上的 6 位数字；
+ *   圆屏验证通过后发 "U,1"，收到后把所有状态重发一遍（验证前发的会被圆屏拒收）。
+ *   监听手机的配对状态，在界面上提示该做什么；forgetOthers() 让圆屏忘掉别的手机（v6.9）
+ * - v7.8 认圆屏：固件 v7.0 起每块圆屏蓝牙名不同（"MotoNav-3A7F"，后 4 位是它的蓝牙地址）。
+ *   App 记住上次验证通过的那块，搜索时先等它 4 秒；4 秒内没出现才连别的（新圆屏也能连上）。
+ *   switchScreen() 换一块：这次搜索跳过现在这块，连附近另一块
+ * - v6.9 手机记着旧配对、圆屏却忘了 → 连上就断：自动检测，能删就自动删掉手机上的旧配对，删不掉就提示去系统设置
+ */
+@SuppressLint("MissingPermission")
+object BleLink {
+    private val SERVICE_UUID: UUID = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+    private val RX_UUID: UUID = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+    private val TX_UUID: UUID = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9e")   // v2.0 圆屏 → 手机
+    private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private const val BULK_HEADER = 15
+
+    private const val RETRY_MS = 5000L
+    private const val SCAN_TIMEOUT_MS = 15000L
+    // Android may accept connectGatt() but never deliver a callback after the
+    // previous app process was killed. Do not let that stale GATT block scans.
+    private const val CONNECT_TIMEOUT_MS = 12000L
+    private const val PREFER_MS = 4000L          // v7.8 先等上次那块圆屏这么久
+    private const val HEARTBEAT_MS = 2000L
+    private const val MAX_WRITE = 500          // 圆屏单个数据包最多收 512 字节，留点余量
+    private const val IMG_HEADER = 10
+    /** Dedicated bulk type; low-performance controllers and old firmware must not receive it. */
+    const val BULK_BACKGROUND = 5
+
+    @Volatile var status = "未连接"
+    @Volatile var verified = false               // v6.4 圆屏说这台手机通过了配对验证（"U,1"）
+    @Volatile var pairHint = ""                  // v6.4 配对过程的提示（给界面看）
+    @Volatile var screenBattery = ""             // v7.6 圆屏电量（固件 v6.8 起，接了电池才有），例 "85%⚡"
+    @Volatile var screenBatteryPct = -1
+    @Volatile var screenName = ""                // v7.8 连着的圆屏蓝牙名，例 "MotoNav-3A7F"（旧固件都叫 "MotoNav"）
+    @Volatile var backgroundImageSupported = false // capability is advertised by newer firmware
+    private var lastAddr: String? = null         // v7.8 上次验证通过的圆屏地址（存在手机上）
+    private var skipAddr = ""                    // v7.8 换圆屏时这次搜索跳过的地址
+    private var candidate: ScanResult? = null    // v7.8 搜到的“别的圆屏”里信号最强的
+    private var scanStartAt = 0L
+    @Volatile var needUnbond = false             // v6.9 手机记着配对、圆屏却不认了：要到系统蓝牙设置里取消配对
+    private var staleCount = 0                   // v6.9 “手机有配对记录、却没通过验证就断开”连续几次
+    private var gatt: BluetoothGatt? = null
+    private var connectAttempt: BluetoothGatt? = null
+    private var rxChar: BluetoothGattCharacteristic? = null
+    private var appContext: Context? = null
+    private var scanning = false
+    private var auto = false
+    private val handler = Handler(Looper.getMainLooper())
+
+    @Volatile var mtu = 23
+    @Volatile private var ready = false        // 服务和大数据包都协商好了，可以发送
+
+    // ---- 发送队列 ----
+    private class Out(val key: String?, var data: ByteArray)
+    private val lock = Any()
+    private val queue = ArrayDeque<Out>()
+    private class BulkPkt(val type: Int, val data: ByteArray)
+    private val bulkQ = ArrayDeque<BulkPkt>()          // v2.0 大块数据
+    private class BulkTransfer(val type: Int, val id: Int, val bytes: Int, val parts: Int, val startedAt: Long) {
+        var submitted = 0
+    }
+    data class BulkTransferStatus(val bytes: Int, val submitted: Int, val parts: Int, val queued: Int, val elapsedMs: Long)
+    private val bulkTransfers = HashMap<Int, BulkTransfer>()
+    private val bulkFailures = HashMap<Int, Pair<Int,String>>()
+    @Volatile var bulkSentKB = 0
+    // v4.6 传输速度统计：一批大块数据从开始发到发完，算平均速度
+    @Volatile var phyText = "?"                       // 蓝牙模式：1M / 2M
+    @Volatile var lastRateKBs = 0.0                   // 最近一批的速度（KB/秒）
+    @Volatile var bestRateKBs = 0.0                   // 最快的一批
+    @Volatile var lastBurstKB = 0                     // 最近一批多大
+    private var burstStart = 0L
+    private var burstBytes = 0L
+    @Volatile var buildingsSupported = false
+    @Volatile var buildingsHeights = false      // v2 固件（CAP,BLD,2）：楼块带高度档，圆屏可 3D 显示
+    @Volatile var screenStats = ""                    // v2.0.1 圆屏发来的帧率统计
+    @Volatile var screenProf = ""                     // v5.8 每帧各步骤用时
+    @Volatile var screenFps = ""                      // v2.6 给新界面用：帧率、屏幕速度、快速刷屏
+    @Volatile var screenMhz = -1
+    @Volatile var screenFast = -1
+    @Volatile var screenHidStatus = ""
+    @Volatile var screenAmsControls = 0
+    @Volatile var screenAmsData = ""
+    private var writing = false
+    // Navigation updates arrive continuously. Allowing them to always win
+    // means bulk map packets never reach the C3, even though the UI reports
+    // that they were queued. Reserve one transfer after a short state burst.
+    private var stateWritesSinceBulk = 0
+    private var writeStartedAt = 0L
+    private var lastWriteAt = 0L
+
+    // ---- 重连后补发用：最近的状态消息和文字图片 ----
+    private val lastState = LinkedHashMap<String, String>()
+    private class Img(val w: Int, val h: Int, val data: ByteArray)
+    private val lastImg = HashMap<Int, Img?>()
+    private val imgId = IntArray(12)               // v5.5 4 → 8：天气用到了图片栏 4，原来只有 0~3 会闪退
+
+    // ---- 给界面看的统计 ----
+    @Volatile var sentCount = 0
+    @Volatile var lastSentMsg = ""
+    @Volatile var lastSentAt = 0L
+    @Volatile var imgSentCount = 0
+
+    private fun now() = SystemClock.elapsedRealtime()
+
+    private fun adapter(): BluetoothAdapter? =
+        (appContext?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+
+    val isConnected: Boolean get() = ready
+
+    // ================= 连接 =================
+
+    fun startAuto(context: Context) {
+        appContext = context.applicationContext
+        registerBondWatch(context.applicationContext)
+        if (auto) return
+        auto = true
+        handler.removeCallbacks(heartbeat)
+        handler.postDelayed(heartbeat, HEARTBEAT_MS)
+        connect(context)
+    }
+
+    fun stopAuto() {
+        auto = false
+        handler.removeCallbacksAndMessages(null)
+        stopScan()
+        synchronized(lock) { writing = false; queue.clear(); bulkQ.clear() }
+        ready = false
+        buildingsSupported=false; buildingsHeights=false
+        try { gatt?.disconnect(); gatt?.close() } catch (_: Exception) {}
+        gatt = null
+        connectAttempt = null
+        rxChar = null
+        status = "已停止"
+    }
+
+    fun connect(context: Context) {
+        appContext = context.applicationContext
+        try {
+            val ad = adapter()
+            if (ad == null || !ad.isEnabled) {
+                status = "请先打开手机蓝牙"
+                scheduleRetry()
+                return
+            }
+            if (gatt != null || scanning) return
+
+            // After the app process is killed Android may keep the peripheral
+            // connected at the system level, so it no longer advertises and a
+            // scan cannot find it. Reattach directly to the last verified
+            // address before falling back to discovery.
+            val known = lastAddr()
+            if (known.isNotEmpty()) {
+                try {
+                    val device = ad.getRemoteDevice(known)
+                    screenName = try { device.name ?: "MotoNav" } catch (_: SecurityException) { "MotoNav" }
+                    status = "正在恢复圆屏连接…"
+                    gatt = device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                    connectAttempt = gatt
+                    handler.removeCallbacks(connectTimeout)
+                    handler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+                    return
+                } catch (_: IllegalArgumentException) {
+                    // Bad or stale persisted address: clear it and scan.
+                    saveLast("")
+                } catch (_: SecurityException) {
+                    // Permission handling below reports the actionable error.
+                }
+            }
+            val scanner = ad.bluetoothLeScanner ?: run { status = "无法扫描"; scheduleRetry(); return }
+            val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build())
+            val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+            scanning = true
+            status = "正在搜索圆屏…"
+            candidate = null
+            scanStartAt = now()
+            scanner.startScan(filters, settings, scanCallback)
+            handler.postDelayed(scanTimeout, SCAN_TIMEOUT_MS)
+            handler.postDelayed(pickCandidate, PREFER_MS)          // v7.8
+        } catch (e: SecurityException) {
+            scanning = false
+            status = "缺少蓝牙权限，请先点「1. 授予权限」"
+        }
+    }
+
+    private val scanTimeout = Runnable {
+        if (scanning) {
+            stopScan()
+            skipAddr = ""                                          // v7.8 附近只有一块：下次也连它
+            status = "没找到圆屏（确认已通电），稍后自动重试"
+            scheduleRetry()
+        }
+    }
+
+    private val retryRunnable = Runnable { appContext?.let { connect(it) } }
+
+    private val connectTimeout = Runnable {
+        val stale = connectAttempt
+        if (stale != null && gatt === stale && !ready) {
+            try { stale.disconnect(); stale.close() } catch (_: Exception) {}
+            if (gatt === stale) {
+                gatt = null
+                rxChar = null
+                mtu = 23
+            }
+            connectAttempt = null
+            // Let the next retry discover the device again instead of
+            // repeatedly attaching to a stale cached GATT address.
+            saveLast("")
+            status = "连接超时，正在重新搜索圆屏…"
+            scheduleRetry()
+        }
+    }
+
+    private fun scheduleRetry() {
+        if (!auto) return
+        handler.removeCallbacks(retryRunnable)
+        handler.postDelayed(retryRunnable, RETRY_MS)
+    }
+
+    private fun stopScan() {
+        handler.removeCallbacks(scanTimeout)
+        handler.removeCallbacks(pickCandidate)
+        if (!scanning) return
+        scanning = false
+        try { adapter()?.bluetoothLeScanner?.stopScan(scanCallback) } catch (_: Exception) {}
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            // 回调在 binder 线程：统一转到主线程再动连接状态，避免和扫描超时、重连并发（可能起两个 GATT）
+            handler.post {
+                if (!scanning) return@post
+                // v7.8 优先连上次那块；别的圆屏先记着，等 4 秒还没见到上次那块再连
+                val addr = result.device.address
+                if (addr == skipAddr) return@post
+                val last = lastAddr()
+                if (last.isEmpty() || addr == last) { connectTo(result); return@post }
+                val c = candidate
+                if (c == null || result.rssi > c.rssi) candidate = result
+                if (now() - scanStartAt >= PREFER_MS) candidate?.let { connectTo(it) }
+            }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            scanning = false
+            handler.removeCallbacks(scanTimeout)
+            status = "扫描失败（$errorCode），稍后自动重试"
+            scheduleRetry()
+        }
+    }
+
+    /** v7.8 等够了还没见到上次那块：连信号最强的另一块 */
+    private val pickCandidate = Runnable { if (scanning) candidate?.let { connectTo(it) } }
+
+    private fun connectTo(r: ScanResult) {
+        stopScan()
+        candidate = null
+        backgroundImageSupported = false
+        screenName = r.scanRecord?.deviceName?.takeIf { it.isNotBlank() }
+            ?: (try { r.device.name } catch (_: SecurityException) { null }) ?: "MotoNav"
+        status = "找到 $screenName，正在连接…"
+        gatt = r.device.connectGatt(appContext, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+        connectAttempt = gatt
+        // A stale system GATT can otherwise leave gatt non-null forever.
+        handler.removeCallbacks(connectTimeout)
+        handler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+    }
+
+    private fun prefs() = appContext?.getSharedPreferences("ble", Context.MODE_PRIVATE)
+    private fun lastAddr(): String {
+        if (lastAddr == null) lastAddr = prefs()?.getString("last", "").orEmpty()
+        return lastAddr.orEmpty()
+    }
+    private fun saveLast(addr: String) {
+        lastAddr = addr
+        prefs()?.edit()?.putString("last", addr)?.apply()
+    }
+
+    /** v7.8 换一块圆屏：断开现在这块，这次搜索跳过它，连附近另一块（另一块验证通过后就记住新的） */
+    fun switchScreen(c: Context) {
+        appContext = c.applicationContext
+        val cur = gatt?.device?.address ?: lastAddr()
+        skipAddr = cur
+        saveLast("")
+        stopScan()
+        handler.removeCallbacks(retryRunnable)
+        ready = false
+        backgroundImageSupported = false
+        buildingsSupported=false; buildingsHeights=false
+        verified = false
+        synchronized(lock) { writing = false; queue.clear(); bulkQ.clear() }
+        try { gatt?.disconnect(); gatt?.close() } catch (_: Exception) {}
+        gatt = null
+        rxChar = null
+        mtu = 23
+        screenName = ""; screenBattery = ""; screenBatteryPct = -1
+        pairHint = ""; staleCount = 0; needUnbond = false
+        connect(c)
+    }
+
+    // 协商大数据包没有回音时的兜底：2 秒后按默认小包继续
+    private val mtuFallback = Runnable { if (!ready && rxChar != null) gatt?.let { enableNotify(it) } }
+    // 订阅通知没有回音时的兜底
+    private val notifyFallback = Runnable { if (!ready && rxChar != null) onLinkReady() }
+
+    /** v2.0：订阅圆屏的通知通道（收“已收齐”确认用）；完成后进入就绪 */
+    private fun enableNotify(g: BluetoothGatt) {
+        val tx = g.getService(SERVICE_UUID)?.getCharacteristic(TX_UUID)
+        val d = tx?.getDescriptor(CCCD_UUID)
+        if (tx == null || d == null) { onLinkReady(); return }   // 旧固件没有通知通道
+        try {
+            g.setCharacteristicNotification(tx, true)
+            val ok = if (Build.VERSION.SDK_INT >= 33) {
+                g.writeDescriptor(d, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                @Suppress("DEPRECATION")
+                g.writeDescriptor(d)
+            }
+            if (!ok) { onLinkReady(); return }
+            handler.postDelayed(notifyFallback, 1500)
+        } catch (_: SecurityException) {
+            onLinkReady()
+        }
+    }
+
+    private fun onNotify(bytes: ByteArray?) {
+        // On some Android stacks the CCCD setup races the first U,1 packet.
+        // Any other notification is emitted by the firmware only after the
+        // authenticated link is usable, so it is a reliable verification
+        // fallback and prevents the UI from remaining in a false pending state.
+        if (ready && !verified && bytes != null && bytes.isNotEmpty()) {
+            verified = true
+            pairHint = ""
+            gatt?.device?.address?.let { saveLast(it); skipAddr = "" }
+            staleCount = 0
+            needUnbond = false
+        }
+        if (bytes != null && bytes.isNotEmpty() && (bytes[0].toInt() and 0xff) == 0xa6) {
+            val generation = if (bytes.size >= 5) {
+                (bytes[1].toInt() and 0xff) or ((bytes[2].toInt() and 0xff) shl 8) or
+                    ((bytes[3].toInt() and 0xff) shl 16) or ((bytes[4].toInt() and 0xff) shl 24)
+            } else 0
+            val field = if (bytes.size >= 8) bytes[7].toInt() and 0xff else -1
+            val payload = if (bytes.size > 11) bytes.copyOfRange(11, bytes.size).toString(Charsets.UTF_8) else ""
+            screenAmsData = "$generation,$field,$payload"
+            return
+        }
+        val msg = bytes?.toString(Charsets.UTF_8)?.trim() ?: return
+        if(msg=="CAP,HID,1") {
+            handler.post { sendEvent("#HM,1"); MusicBridge.refresh(true) }
+            return
+        }
+        if (msg.startsWith("CAP,BG,1")) { backgroundImageSupported = true; return }
+        if (msg.startsWith("HID,")) { screenHidStatus = msg; return }
+        if (msg.startsWith("AMC,")) { screenAmsControls = msg.substringAfter(',').toIntOrNull() ?: 0; return }
+        if(msg=="CAP,BLD,2" || msg=="CAP,BLD,1") {
+            val heights = msg=="CAP,BLD,2"
+            handler.post { if(!buildingsSupported || buildingsHeights != heights) {
+                buildingsSupported=true; buildingsHeights=heights; MapFeeder.onBuildingCapability() } }
+            return
+        }
+        val p = msg.split(',')
+        if(p.size>=5 && p[0]=="CAP" && p[1]=="BLD" && p[2]=="1" && p[3]=="C3") {
+            // v7.13 起 C3 固件不再声明楼块；这里只为旧 C3 固件接收小屏缓冲上限（普通底图裁剪用），
+            // 不再把它视为支持楼块
+            handler.post { MapFeeder.onSmallDisplayCapability(p[4].toIntOrNull() ?: 8192) }
+            return
+        }
+        if (p.size >= 3 && p[0] == "T" && p[1] == "M") { MusicBridge.onScreenEvent(p[2], p.drop(3).joinToString(",")); return }
+        if (p.size >= 4 && p[0] == "S") {               // v2.0.1 圆屏帧率统计
+            val mhz = if (p.size >= 5) "，屏幕速度 ${p[4]}MHz" else ""
+            screenFps = p[1]
+            if (p.size >= 5) screenMhz = p[4].toIntOrNull() ?: -1
+            if (p.size >= 8) screenFast = p[7].toIntOrNull() ?: -1
+            val more = if (p.size >= 8) "\n其中画地图 ${p[5]} 毫秒，画边框和信息 ${p[6]} 毫秒；快速刷屏${if (p[7] == "1") "开" else "关"}" else ""
+            val ras = if (p.size >= 10 && p[8] != "0") "\n画地图里，天地图底图占 ${p[8]} 毫秒（${p[9]} 个核心一起画）" else ""   // v5.7
+            screenStats = "小地图 ${p[1]} 帧/秒（画一帧 ${p[2]} 毫秒，推到屏幕 ${p[3]} 毫秒$mhz）$more$ras"
+            return
+        }
+        if (p.size >= 2 && p[0] == "T") { CallWatcher.onScreenTouch(p); return }   // v5.3 圆屏触屏接听
+        if (p.size >= 3 && p[0] == "V") {                // v7.6 圆屏电量：V,百分比,充电,USB,mV
+            val pct = p[1].toIntOrNull() ?: -1
+            screenBatteryPct = pct
+            screenBattery = if (pct < 0) "" else "$pct%" + (if (p[2] == "1") "⚡充电中" else "")
+            return
+        }
+        if (p.size >= 2 && p[0] == "BOOT") {
+            val id = p[1].toIntOrNull()
+            if (id == -1) BootBrand.onSaveError() else id?.let { BootBrand.onReply(it) }
+            return
+        }
+        if (p.size >= 2 && p[0] == "U") {                // v6.4 圆屏：这台手机验证通过了
+            if (!verified) {
+                verified = true
+                pairHint = ""
+                gatt?.device?.address?.let { saveLast(it); skipAddr = "" }   // v7.8 记住这块是“我的圆屏”
+                staleCount = 0; needUnbond = false
+                handler.post { resendAll() }             // 验证前发的东西圆屏没收：全部重发
+            }
+            // The capability notification can race with CCCD setup on some
+            // Android phones.  Make the media mode idempotent and resend it
+            // after authentication so the HID service is enabled reliably.
+            handler.post { sendEvent("#HM,1"); MusicBridge.refresh(true) }
+            return
+        }
+        if (p.size >= 12 && p[0] == "Q") {             // v5.8 圆屏每帧各步骤用时（0.1 毫秒）
+            val names = listOf("底图", "道路", "路线", "红绿灯/电子眼/车头", "边缘渐暗", "北标/电子眼图标",
+                "外圈", "车速/测速牌", "车道", "底部箭头和距离", "提示")
+            screenProf = "各步骤用时（毫秒/帧）：" + names.indices.joinToString("，") { i ->
+                "${names[i]} ${"%.1f".format((p[i + 1].toIntOrNull() ?: 0) / 10f)}"
+            }
+            return
+        }
+        if (p.size >= 3 && p[0] == "K") {
+            val t = p[1].toIntOrNull() ?: return
+            val id = p[2].toIntOrNull() ?: return
+            MapFeeder.onAck(t, id)
+        }
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(g: BluetoothGatt, st: Int, newState: Int) {
+            if (gatt !== g) return
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                verified = false
+                buildingsSupported=false; buildingsHeights=false
+                // Capability is per-device/per-connection. Clear a prior C3
+                // small-display limit before service discovery on a new link;
+                // an S3/185B must receive the full raster unless it explicitly
+                // advertises the C3 capability again.
+                MapFeeder.onSmallDisplayCapability(0)
+                screenBattery = ""; screenBatteryPct = -1
+                status = "已连接，正在读取服务…"
+                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                g.discoverServices()
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                handler.removeCallbacks(connectTimeout)
+                connectAttempt = null
+                checkStaleBond(g)                        // v6.9 先看看是不是“手机记着、圆屏忘了”
+                ready = false
+        buildingsSupported=false; buildingsHeights=false
+                MapFeeder.onSmallDisplayCapability(0)
+                verified = false
+                synchronized(lock) { writing = false; queue.clear(); bulkQ.clear() }
+                rxChar = null
+                g.close()
+                if (gatt === g) gatt = null
+                mtu = 23
+                phyText = "?"; burstStart = 0L
+                status = if (auto) "连接断开，正在自动重连…" else "连接断开"
+                scheduleRetry()
+                handler.postDelayed({ appContext?.let { if (auto && gatt == null && !scanning) connect(it) } }, 700)
+            }
+        }
+
+        override fun onServicesDiscovered(g: BluetoothGatt, st: Int) {
+            if (st != BluetoothGatt.GATT_SUCCESS) {
+                handler.removeCallbacks(connectTimeout)
+                connectAttempt = null
+                try { g.disconnect(); g.close() } catch (_: Exception) {}
+                if (gatt === g) gatt = null
+                ready = false
+                status = "服务读取失败，正在重试…"
+                scheduleRetry()
+                return
+            }
+            rxChar = g.getService(SERVICE_UUID)?.getCharacteristic(RX_UUID)
+            if (rxChar == null) {
+                handler.removeCallbacks(connectTimeout)
+                connectAttempt = null
+                status = "连上了但找不到服务，检查 UUID"
+                try { g.disconnect(); g.close() } catch (_: Exception) {}
+                if (gatt === g) gatt = null
+                scheduleRetry()
+                return
+            }
+            status = "已连接，正在协商数据包大小…"
+            if (!g.requestMtu(517)) {
+                enableNotify(g)
+            } else {
+                handler.postDelayed(mtuFallback, 2000)
+            }
+        }
+
+        override fun onMtuChanged(g: BluetoothGatt, newMtu: Int, st: Int) {
+            handler.removeCallbacks(mtuFallback)
+            if (st == BluetoothGatt.GATT_SUCCESS) mtu = newMtu
+            // v4.6 请求蓝牙 2M 模式（速度翻倍）；手机或圆屏不支持时会自动保持 1M
+            try {
+                if (Build.VERSION.SDK_INT >= 26)
+                    g.setPreferredPhy(BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_LE_2M_MASK, BluetoothDevice.PHY_OPTION_NO_PREFERRED)
+            } catch (_: Throwable) {}
+            if (!ready) enableNotify(g)
+        }
+
+        // v4.6 蓝牙模式变了 / 读到了
+        override fun onPhyUpdate(g: BluetoothGatt, txPhy: Int, rxPhy: Int, st: Int) { phyText = phyName(txPhy) }
+        override fun onPhyRead(g: BluetoothGatt, txPhy: Int, rxPhy: Int, st: Int) { phyText = phyName(txPhy) }
+
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, st: Int) {
+            handler.removeCallbacks(notifyFallback)
+            if (!ready) handler.post { if (!ready) onLinkReady() }
+        }
+
+        @Deprecated("Android 13 以下用这个")
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            @Suppress("DEPRECATION")
+            if (c.uuid == TX_UUID) onNotify(c.value)
+        }
+
+        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
+            if (c.uuid == TX_UUID) onNotify(value)
+        }
+
+        // 上一条发完了：解锁，发下一条
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, st: Int) {
+            synchronized(lock) { writing = false }
+            pump()
+        }
+    }
+
+    private fun phyName(p: Int) = when (p) { 1 -> "1M"; 2 -> "2M"; 3 -> "Coded"; else -> "?" }
+
+    /** 连接完全就绪：补发最近的全部状态和图片 */
+    private fun onLinkReady() {
+        if (ready) return
+        handler.removeCallbacks(connectTimeout)
+        connectAttempt = null
+        ready = true
+        try { if (Build.VERSION.SDK_INT >= 26) gatt?.readPhy() } catch (_: Throwable) {}     // v4.6
+        status = "已连接（高速模式，数据包 ${maxWrite()} 字节）"
+        resendAll()
+    }
+
+    /** 补发最近的全部状态、图片、地图（连上时 / v6.4 配对验证通过时） */
+    private fun resendAll() {
+        if (!ready) return
+        synchronized(lock) {
+            queue.clear()
+            bulkQ.clear()
+            bulkTransfers.clear()
+            writing = false
+            stateWritesSinceBulk = 0
+            // 亮度放最前面，然后是导航和其他状态
+            lastState["#b"]?.let { enqueue("#b", it.toByteArray()) }
+            for ((k, v) in lastState) if (k != "#b") enqueue(k, v.toByteArray())
+            for ((slot, img) in lastImg) enqueueImage(slot, img)
+        }
+        pump()
+        MusicBridge.refresh(true)
+        BootBrand.sync()
+        HomeAnimation.sync()
+        MapFeeder.onLinkReady()            // v2.0 地图块和路线重发
+    }
+
+    private fun maxWrite(): Int = minOf(mtu - 3, MAX_WRITE)
+
+    // ================= 心跳 =================
+
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            val idle = synchronized(lock) { queue.isEmpty() && bulkQ.isEmpty() && !writing }
+            if (ready && idle && now() - lastWriteAt > HEARTBEAT_MS - 500) send("P")
+            if (auto) handler.postDelayed(this, HEARTBEAT_MS)
+        }
+    }
+
+    // ================= 发送 =================
+
+    /** 文字消息的类型：同类型在队列里只保留最新一条 */
+    private fun keyOf(msg: String): String = when {
+        // v6.3 "#D角度"、v7.2 "#L毫秒" 这类没有逗号的：按前两个字符算同一类（只留最新的）
+        msg.startsWith("#") -> if (msg.contains(',')) msg.substringBefore(',') else msg.take(2)
+        msg == "P" -> "P"
+        else -> "NAV"                      // 导航方向和清屏 C
+    }
+
+    /** 发送一条文字消息（导航、车速、测速、车道、亮度、心跳） */
+    fun send(msg: String) {
+        val k = keyOf(msg)
+        synchronized(lock) {
+            if (msg == "C") {
+                // 清屏：圆屏会清掉所有状态，这边也忘掉（亮度除外），重连后不再补发旧数据
+                val b = lastState["#b"]
+                lastState.clear()
+                if (b != null) lastState["#b"] = b
+                lastImg.clear()
+                queue.removeAll { it.key != null && it.key.startsWith("B") }
+            }
+            if (k != "P") lastState[k] = msg
+            enqueue(k, msg.toByteArray(Charsets.UTF_8))
+        }
+        pump()
+    }
+
+    /** v7.9 发一次性的事件（到达统计、途经点）：不记进“重连补发”，免得重连后又放一遍特效 */
+    fun sendEvent(msg: String) {
+        synchronized(lock) { enqueue("EV" + msg.take(2), msg.toByteArray(Charsets.UTF_8)) }   // 先后顺序无所谓：圆屏放特效 0.9 秒后才显示统计
+        pump()
+    }
+
+    /** 发送一张文字图片；w = 0 表示清空这一栏 */
+    fun clearWeather() {
+        synchronized(lock) {
+            lastState.remove("#W"); lastState.remove("#WX")
+            for (slot in listOf(3, 4, 7, 8, 9, 10, 11)) lastImg.remove(slot)
+            queue.removeAll { it.key == "#W" || it.key == "#WX" }
+        }
+        sendEvent("#WXRESET")
+    }
+
+    fun sendImage(slot: Int, w: Int, h: Int, data: ByteArray) {
+        val img = Img(w, h, data)
+        synchronized(lock) {
+            lastImg[slot] = img
+            enqueueImage(slot, img)
+        }
+        pump()
+    }
+
+    fun sendBackgroundImage(w: Int, h: Int, data: ByteArray): Boolean {
+        if (!backgroundImageSupported) {
+            status = "当前圆屏是低性能主控或旧固件，不支持背景图"
+            return false
+        }
+        val header = byteArrayOf(w.toByte(), (w shr 8).toByte(), h.toByte(), (h shr 8).toByte())
+        sendBulk(BULK_BACKGROUND, (SystemClock.elapsedRealtime() and 0xff).toInt(), header + data)
+        return true
+    }
+
+    /**
+     * v2.0 发送一份大块数据（地图块/路线）。同类型还没发完的旧数据直接作废。
+     * 每片：'M' 类型 编号 总片数(2) 片序号(2) 总字节(4) 偏移(4) + 数据
+     */
+    fun sendBulk(type: Int, id: Int, data: ByteArray) {
+        synchronized(lock) {
+            bulkQ.removeAll { it.type == type }
+            val payload = maxWrite() - BULK_HEADER
+            // Keep the bulk request until the link is ready.  MapFeeder can
+            // build a chunk while pairing/MTU negotiation is still running;
+            // dropping it here leaves the UI stuck at "waiting for screen
+            // confirmation" even though the route (sent later) succeeds.
+            if (payload < 100) {
+                bulkTransfers.remove(type)
+                bulkFailures[type] = (id and 0xFF) to "当前蓝牙 MTU 只有 ${mtu}，地图协议至少需要 118 字节有效负载"
+                if (ready) status = "蓝牙数据包协商失败，无法发送地图"
+                return
+            }
+            val parts = (data.size + payload - 1) / payload
+            if (parts > 4000 || data.isEmpty()) {
+                bulkTransfers.remove(type)
+                bulkFailures[type] = (id and 0xFF) to if(data.isEmpty()) "地图数据为空" else "地图分片数超过协议上限"
+                return
+            }
+            bulkFailures.remove(type)
+            val transfer = BulkTransfer(type, id and 0xFF, data.size, parts, now())
+            bulkTransfers[type] = transfer
+            for (p in 0 until parts) {
+                val off = p * payload
+                val len = minOf(payload, data.size - off)
+                val h = byteArrayOf(
+                    'M'.code.toByte(), type.toByte(), id.toByte(),
+                    parts.toByte(), (parts shr 8).toByte(), p.toByte(), (p shr 8).toByte(),
+                    data.size.toByte(), (data.size shr 8).toByte(), (data.size shr 16).toByte(), (data.size shr 24).toByte(),
+                    off.toByte(), (off shr 8).toByte(), (off shr 16).toByte(), (off shr 24).toByte()
+                )
+                bulkQ.addLast(BulkPkt(type, h + data.copyOfRange(off, off + len)))
+            }
+            bulkSentKB += data.size / 1024
+        }
+        if (!ready) {
+            status = "地图已排队，等待蓝牙就绪"
+            return
+        }
+        pump()
+    }
+
+    /** Cancel queued map fragments while leaving route and position delivery intact. */
+    fun cancelBulk(vararg types: Int) {
+        synchronized(lock) {
+            bulkQ.removeAll { it.type in types }
+            types.forEach { bulkTransfers.remove(it) }
+            types.forEach { bulkFailures.remove(it) }
+        }
+    }
+
+    fun bulkPending(): Boolean = synchronized(lock) { bulkQ.isNotEmpty() }
+
+    fun bulkTransferStatus(type: Int, id: Int): BulkTransferStatus? = synchronized(lock) {
+        val t=bulkTransfers[type]?.takeIf { it.id==(id and 0xFF) } ?: return@synchronized null
+        val queued=bulkQ.count { it.type==type && it.data.size>2 && (it.data[2].toInt() and 255)==(id and 255) }
+        BulkTransferStatus(t.bytes,t.submitted,t.parts,queued,now()-t.startedAt)
+    }
+
+    fun bulkTransferError(type: Int, id: Int): String? = synchronized(lock) {
+        bulkFailures[type]?.takeIf { it.first==(id and 0xFF) }?.second
+    }
+
+    /** Submission progress only; firmware ACK is the sole proof of a received map. */
+    fun bulkProgress(type: Int, id: Int): Int? = synchronized(lock) {
+        val t=bulkTransfers[type]?.takeIf { it.id==(id and 0xFF) } ?: return@synchronized null
+        (t.submitted*100/t.parts).coerceIn(0,100)
+    }
+
+    /** 把图片切片放进队列（需持有 lock） */
+    private fun enqueueImage(slot: Int, img: Img?) {
+        // 同一栏还没发出去的旧图片片段全部作废
+        queue.removeAll { it.key != null && it.key.startsWith("B$slot:") }
+        if (img == null) return
+        val id = (++imgId[slot]) and 0xFF
+        val payload = maxWrite() - IMG_HEADER
+        if (img.w == 0 || img.data.isEmpty()) {
+            queue.addLast(Out("B$slot:$id:0", header(slot, id, 0, 1, 0, 0, 0)))
+            return
+        }
+        // 没协商到大数据包（payload<16）或分片超上限：发不出这张图，补一张“清空”包，
+        // 免得圆屏留旧图、重连后 resendAll 又反复重试同一张发不出的图
+        val parts = (img.data.size + payload - 1) / payload
+        if (payload < 16 || parts > 32) {
+            queue.addLast(Out("B$slot:$id:0", header(slot, id, 0, 1, 0, 0, 0)))
+            return
+        }
+        for (p in 0 until parts) {
+            val off = p * payload
+            val len = minOf(payload, img.data.size - off)
+            val pkt = header(slot, id, p, parts, img.w, img.h, off) + img.data.copyOfRange(off, off + len)
+            queue.addLast(Out("B$slot:$id:$p", pkt))
+        }
+        imgSentCount++
+    }
+
+    private fun header(slot: Int, id: Int, part: Int, parts: Int, w: Int, h: Int, off: Int): ByteArray =
+        byteArrayOf(
+            'B'.code.toByte(), slot.toByte(), id.toByte(), part.toByte(), parts.toByte(),
+            (w and 0xFF).toByte(), (w shr 8).toByte(), h.toByte(),
+            (off and 0xFF).toByte(), (off shr 8).toByte()
+        )
+
+    /** 放进队列：同类型的状态消息直接替换原位置的旧消息（需持有 lock） */
+    private fun enqueue(key: String, data: ByteArray) {
+        val existing = queue.firstOrNull { it.key == key }
+        if (existing != null) {
+            existing.data = data
+        } else {
+            queue.addLast(Out(key, data))
+        }
+        while (queue.size > 120) queue.removeFirst()
+    }
+
+    /** 如果空闲，就发队列里的下一条 */
+    private fun pump() {
+        synchronized(lock) {
+            if (!ready) return
+            val stuck = now() - writeStartedAt > 1000
+            if (writing && !stuck) return
+            // Do not let continuous position/status traffic starve the map.
+            // Send at most four state packets, then one bulk fragment.
+            val sendBulkNow = bulkQ.isNotEmpty() && (queue.isEmpty() || stateWritesSinceBulk >= 4)
+            if (sendBulkNow) {
+                val b = bulkQ.firstOrNull() ?: run { writing = false; return }
+                if (writeNow(b.data)) {
+                    bulkQ.removeFirst()
+                    bulkTransfers[b.type]?.let { transfer ->
+                        if (b.data.size>2 && (b.data[2].toInt() and 255)==transfer.id)
+                            transfer.submitted=(transfer.submitted+1).coerceAtMost(transfer.parts)
+                    }
+                    stateWritesSinceBulk = 0
+                    writing = true
+                    writeStartedAt = now()
+                    lastWriteAt = writeStartedAt
+                    // v4.6 速度统计：一批大块数据从第一片到最后一片
+                    if (burstStart == 0L) { burstStart = writeStartedAt; burstBytes = 0L }
+                    burstBytes += b.data.size
+                    if (bulkQ.isEmpty()) {
+                        val dt = (writeStartedAt - burstStart) / 1000.0
+                        if (burstBytes >= 8 * 1024 && dt > 0.05) {
+                            lastRateKBs = burstBytes / 1024.0 / dt
+                            lastBurstKB = (burstBytes / 1024).toInt()
+                            if (lastRateKBs > bestRateKBs) bestRateKBs = lastRateKBs
+                        }
+                        burstStart = 0L
+                    }
+                } else {
+                    writing = false
+                    handler.postDelayed({ pump() }, 30)
+                }
+                return
+            }
+            val next = queue.firstOrNull()
+            if (next == null) { writing = false; return }
+            if (writeNow(next.data)) {
+                queue.removeFirst()
+                writing = true
+                stateWritesSinceBulk++
+                writeStartedAt = now()
+                lastWriteAt = writeStartedAt
+                if (next.key != "P" && next.key?.startsWith("B") != true) {
+                    sentCount++
+                    lastSentMsg = String(next.data, Charsets.UTF_8)
+                    lastSentAt = writeStartedAt
+                }
+            } else {
+                writing = false
+                handler.postDelayed({ pump() }, 30)   // 蓝牙忙，稍后重试
+            }
+        }
+    }
+
+    private fun writeNow(bytes: ByteArray): Boolean {
+        val g = gatt ?: return false
+        val c = rxChar ?: return false
+        return try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                g.writeCharacteristic(c, bytes, BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) ==
+                    BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                c.value = bytes
+                c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                @Suppress("DEPRECATION")
+                g.writeCharacteristic(c)
+            }
+        } catch (_: SecurityException) {
+            status = "缺少蓝牙权限"
+            false
+        }
+    }
+
+    /** 给界面显示的统计文字 */
+    fun statsText(): String {
+        if (sentCount == 0) return "还没发送过指令"
+        val ago = (now() - lastSentAt) / 1000.0
+        val q = synchronized(lock) { queue.size }
+        val bq = synchronized(lock) { bulkQ.size }
+        return "已发送 $sentCount 条，文字图片 $imgSentCount 张，队列 $q，地图待发 $bq 片（累计 $bulkSentKB KB）\n" +
+            "最近发送：$lastSentMsg（${"%.1f".format(ago)} 秒前）\n" +
+            speedText()
+    }
+
+    /** v4.6 蓝牙模式和实测传输速度 */
+    fun speedText(): String {
+        val r = if (lastRateKBs > 0) "最近一批 $lastBurstKB KB，${"%.0f".format(lastRateKBs)} KB/秒（最快 ${"%.0f".format(bestRateKBs)} KB/秒）"
+                else "还没测到（发一次地图块或路线后显示）"
+        return "蓝牙 $phyText 模式，数据包 ${maxWrite()} 字节；$r"
+    }
+
+    // ================= v6.4 配对 =================
+
+    private var bondWatching = false
+    private val bondReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            val dev: BluetoothDevice? = if (Build.VERSION.SDK_INT >= 33)
+                i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            else @Suppress("DEPRECATION") i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            val mine = gatt?.device ?: return
+            if (dev == null || dev.address != mine.address) return
+            val prev = i.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
+            when (i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)) {
+                BluetoothDevice.BOND_BONDING ->
+                    pairHint = "正在配对：在手机弹出的配对框里输入圆屏上显示的 6 位数字（没弹出就下拉通知栏看看）"
+                BluetoothDevice.BOND_BONDED ->
+                    pairHint = "配对成功，正在验证…"
+                BluetoothDevice.BOND_NONE -> if (prev == BluetoothDevice.BOND_BONDING)
+                    pairHint = "配对没成功。圆屏显示 LOCKED 的话：重启圆屏，2 分钟内再连"
+            }
+        }
+    }
+
+    private fun registerBondWatch(c: Context) {
+        if (bondWatching) return
+        bondWatching = true
+        val f = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        try {
+            // 受保护的系统广播：NOT_EXPORTED 也能收到
+            if (Build.VERSION.SDK_INT >= 33) c.registerReceiver(bondReceiver, f, Context.RECEIVER_NOT_EXPORTED)
+            else c.registerReceiver(bondReceiver, f)
+        } catch (_: Exception) { bondWatching = false }
+    }
+
+    /** v6.9 让圆屏忘掉“别的”手机（固件 v6.6 起保留正在连着的这台；旧的 v6.5 固件会全部忘掉） */
+    fun forgetOthers() {
+        send("#UNPAIR")
+        pairHint = ""
+    }
+
+    /**
+     * v6.9 手机上还记着和圆屏的配对，圆屏却已经忘了（比如用 v6.5 固件点过“全部忘掉”、或者重新刷了固件）：
+     * 手机拿旧钥匙去加密，圆屏不认，连上就断。连续两次这样，就先试着自动删掉手机上的旧配对；
+     * 删不掉（新安卓不让 App 删）就提示到系统蓝牙设置里手动“取消配对”。
+     */
+    private fun checkStaleBond(g: BluetoothGatt) {
+        if (verified) { staleCount = 0; return }
+        val dev = g.device ?: return
+        val bonded = try { dev.bondState == BluetoothDevice.BOND_BONDED } catch (_: SecurityException) { false }
+        if (!bonded) { staleCount = 0; return }
+        staleCount++
+        if (staleCount < 2) return
+        val removed = try { dev.javaClass.getMethod("removeBond").invoke(dev) as? Boolean ?: false } catch (_: Throwable) { false }
+        if (removed) {
+            needUnbond = false
+            staleCount = 0
+            pairHint = "圆屏不认识这台手机的旧配对了，已自动清掉，正在重连：手机弹出配对框时输入圆屏上的 6 位数字"
+        } else {
+            needUnbond = true
+            pairHint = "圆屏不认识这台手机的旧配对了：点这里打开系统蓝牙设置，在已配对设备里对 ${screenName.ifEmpty { "MotoNav" }} 点「取消配对 / 忽略」，" +
+                "再回来会自动重连，输入圆屏上的配对码"
+        }
+    }
+
+}

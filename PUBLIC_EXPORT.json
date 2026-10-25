@@ -1,0 +1,21 @@
+{
+  "appVersion": "8.4",
+  "boards": [
+    "Waveshare ESP32-S3-Touch-AMOLED-1.75"
+  ],
+  "firmwareVersion": "7.12.1-lowmem",
+  "fileCount": 782,
+  "credentialsIncluded": false,
+  "signingFilesIncluded": false,
+  "anonymousBuildVerified": true,
+  "anonymousBuildSignatureVerified": true,
+  "privateLogsIncluded": false,
+  "originalGitHistoryIncluded": false,
+  "date": "2026-10-16",
+  "namespace": "com.example.motonav",
+  "existingLogicChecks": 41,
+  "showcaseIncluded": true,
+  "simulationImages": 3,
+  "mutedVideos": 3,
+  "photos": 7
+}
