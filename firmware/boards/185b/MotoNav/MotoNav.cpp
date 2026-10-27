@@ -235,7 +235,7 @@
 //   U,1                   v6.5 这台手机通过了配对验证（连上后发 3 次）
 //   V,电量,充电,USB,mV    v6.8 圆屏电池（电量 -1 = 没接电池）
 
-#define FW_VERSION "v7.14.6-185B"
+#define FW_VERSION "v7.13.8-185B"
 
 // 调试时想在串口监视器里看到每条收到的文字指令，把 0 改成 1
 #define DEBUG_SERIAL 0
@@ -1325,24 +1325,22 @@ uint32_t imuBootMs=0, imuStillSince=0;
 uint16_t imuCalSamples=0;
 bool imuFilterStarted=false;
 
-// ---- v7.14.0 G 值算法 ----
-// imuLatG / imuLonG：按 dt 归一、在 imuTick 里算好的侧向 / 纵向 G（已平滑），绘制层只读。
-// imuLeanSign：倾角符号（带 3° 滞环）。加速度计只能给出 |φ|，符号必须靠陀螺积分。
-#define G_LEAN_SIGN 1.0f            // 上车后若倾角 / 侧向 G 方向相反，改成 -1.0f
-// v7.14.3 调试用：G 页底部打两行车身坐标 / 倾角小字，确认安装方向对不对。
-//   加速前进 → F 应为正；刹车 → F 为负；平放 → U≈1.00。
-//   v7.14.6 起默认关闭（页面保持干净），要排查时改回 1。
+// ---- G 值算法：照抄 TioRuben/chrono-g ----
+// 三轴比力各过一阶 EMA（α=0.015），侧向 / 纵向 G 和峰值都在 imuTick 里算好，绘制层只读。
+float imuEmaR=0, imuEmaF=0, imuEmaU=1;   // EMA 后的车身比力分量（g）：右/前/上
+bool  imuEmaInit=false;
+float imuLatG=0, imuLonG=0;              // 侧向 / 纵向 G（已平滑）
+float imuLeanSign=1.0f;                  // 倾角符号（3° 滞环），姿态融合用
+// 调试：G 页底部打两行车身坐标 / 倾角小字，确认安装方向（加速前进 F 应为正），默认关。
 #define IMU_SHOW_AXES 0
-float imuLatG=0, imuLonG=0;
-float imuLeanSign=1.0f;
-// v7.14.1 静止检测（ZUPT）：用陀螺 0.5s 窗口的均值/方差判断"稳不稳"，不看绝对值。
+// v7.13.8 静止检测（ZUPT）：用陀螺 0.5s 窗口的均值/方差判断"稳不稳"，不看绝对值。
 // 零偏本身可能有好几 dps，用 |gyro|<2dps 这种绝对门限会把静止误判成运动，
 // 结果零偏永远学不到、roll 一路积分漂走 —— 这就是"放着不动 lean 一直涨"的原因。
 float imuGyroAvgX=0, imuGyroAvgY=0, imuGyroAvgZ=0;
 float imuGyroVarX=0, imuGyroVarY=0, imuGyroVarZ=0;
 bool  imuStill=false;
 
-// ---- v7.14.3 车身坐标映射（这一版修的就是它）----
+// ---- v7.13.8 车身坐标映射（这一版修的就是它）----
 // 185B 的实际安装：屏幕朝上、屏幕顶边朝车头（G 页的 FRONT 就画在顶上，用户就是这么读的）。
 // QMI8658 的轴跟屏幕对齐，于是：
 //     IMU X = 车身右 (right)   IMU Y = 车身前 (forward)   IMU Z = 车身上 (up)
@@ -1362,7 +1360,7 @@ static inline void imuToBody(const float *raw, float &r, float &f, float &u) {
 }
 // 车身坐标下的比力分量（g）。给屏幕上的调轴小字用，确认安装方向对不对。
 float imuBodyR=0, imuBodyF=0, imuBodyU=1;
-float imuRollRel=0, imuLatBDbg=0;   // 调试用：相对倾角、tan(相对倾角)
+float imuRollRel=0;                 // 调试用：相对倾角
 
 static float imuWrap180(float deg) {
   while (deg > 180.0f) deg -= 360.0f;
@@ -1390,7 +1388,7 @@ void imuResetReference() {
 void imuTick(){
   if(!imuOK) return;
   const uint32_t now = millis();
-  // v7.14.0 采样节流到 8ms（≈125Hz，QMI8658 的 ODR 是 112Hz）。主循环是 kHz 级，
+  // v7.13.8 采样节流到 8ms（≈125Hz，QMI8658 的 ODR 是 112Hz）。主循环是 kHz 级，
   // 不节流会反复读到同一个样本，所有"每次调用"给的滤波系数都会失真：原来加速度权重 0.04
   // 相当于每毫秒修正一次，等效时间常数只有 25ms，压弯时 roll 被瞬间拉回 0。
   if (imuLastMs && (now - imuLastMs) < 8) return;
@@ -1404,7 +1402,7 @@ void imuTick(){
   imuAy=a.mps2.y/9.80665f;
   imuAz=a.mps2.z/9.80665f;
   imuG=sqrtf(imuAx*imuAx+imuAy*imuAy+imuAz*imuAz);
-  // v7.14.3 先把原始三轴换成车身坐标，后面所有姿态和 G 都用车身轴算。
+  // v7.13.8 先把原始三轴换成车身坐标，后面所有姿态和 G 都用车身轴算。
   const float rawA[3] = { imuAx, imuAy, imuAz };
   float aR, aF, aU;
   imuToBody(rawA, aR, aF, aU);
@@ -1413,7 +1411,7 @@ void imuTick(){
   // 所以取 -aR。抬头为正的俯仰用 aF。
   const float ar=atan2f(-aR,aU)*57.2957795f;
   const float ap=atan2f(aF,sqrtf(aR*aR+aU*aU))*57.2957795f;
-  // ---- v7.14.1 静止检测（ZUPT）----
+  // ---- v7.13.8 静止检测（ZUPT）----
   // 只看陀螺"稳不稳"：0.5s 窗口的均值与方差。方差小 + 合力≈1g → 静止。
   // 老代码用 |gyro|<2dps 的绝对门限，零偏一旦超过 2dps 就永远判不成静止，
   // 零偏学不到 → roll 纯积分 → 放着不动 LEAN 也一路涨。
@@ -1453,7 +1451,7 @@ void imuTick(){
   // 零偏已在上面按 imuStill 更新过，这里直接减；静止时顺手记一下 still 起点。
   if (imuStill) { if (!imuStillSince) imuStillSince = now; }
   else imuStillSince = 0;
-  // v7.14.3 陀螺也换到车身轴：绕"右"轴 = 俯仰角速度，绕"前"轴 = 横滚角速度，绕"上"轴 = 偏航。
+  // v7.13.8 陀螺也换到车身轴：绕"右"轴 = 俯仰角速度，绕"前"轴 = 横滚角速度，绕"上"轴 = 偏航。
   // 旧代码直接拿 gyro X 当横滚、gyro Y 当俯仰，跟加速度计一样差了 90° —— 压弯时积分的是
   // 俯仰率（≈0），所以 imuRoll 一直是 0，imuLeanSign 永远学不到 -1，横向 G 恒为正。
   const float rawG[3] = { g.dps.x - imuGyroBiasX, g.dps.y - imuGyroBiasY, g.dps.z - imuGyroBiasZ };
@@ -1463,13 +1461,13 @@ void imuTick(){
   float wYaw = gU;
   if (fabsf(wYaw) < 0.35f) wYaw = 0;
 
-  // ---- v7.14.0 roll ----
+  // ---- v7.13.8 roll ----
   // 关键事实：稳态压弯时重力和向心加速度的合力正好沿车身竖直轴，所以车身"右""前"两个分量
   // 都是 0、竖直分量 = 1/cos(φ)。也就是说 atan2(-aR,aU) 在压弯时恒等于 0 —— 加速度计在压弯
   // 时拿不到倾角信息，分不出重力和向心加速度。这是老版本"压弯时 G 值不动"的根因。
   // 正确做法：加速度计只用来给 |φ|（由合力大小反解，稳态压弯精确且与陀螺漂移无关），
   // 符号交给陀螺积分。纵向加速度按 pitch 去掉，否则刹车会被误判成压弯。
-  // v7.14.3 lonNow 改成车身坐标：世界水平前方向 = cosθ·F − sinθ·U，所以
+  // v7.13.8 lonNow 改成车身坐标：世界水平前方向 = cosθ·F − sinθ·U，所以
   //   lonNow = aF·cosθ − aU·sinθ（θ 为俯仰）。静止时它恒等于 0，与安装俯仰无关。
   const float thAbs = imuPitch * 0.017453293f;
   const float lonNow = aF * cosf(thAbs) - aU * sinf(thAbs);          // 去重力后的纵向比力
@@ -1489,7 +1487,7 @@ void imuTick(){
     float w2 = constrain((latMagDeg - 8.0f) / 10.0f, 0.0f, 1.0f);
     w2 *= constrain((dev - 0.010f) / 0.006f, 0.0f, 1.0f);
     w2 *= constrain(1.0f - (fabsf(lonNow) - 0.20f) / 0.25f, 0.0f, 1.0f);  // 纵向加速大时不信
-    // v7.14.2 "放着不动 LEAN 一直涨"的根治：静止判定成立时无条件、快速地信任加速度计。
+    // v7.13.8 "放着不动 LEAN 一直涨"的根治：静止判定成立时无条件、快速地信任加速度计。
     //   原来的门限有个缝：imuStill 允许 dev 到 0.04，而 w1 在 dev=0.014 就已经衰减到 0 ——
     //   落在 0.014~0.04 这一档时被判成静止（零偏照学）却没有任何绝对基准，姿态只能靠积分，
     //   陀螺零偏残余就一点点累积上去。静止判定本身已经要求 |f|≈1 且陀螺方差极小，这时
@@ -1517,45 +1515,33 @@ void imuTick(){
   }
   imuYaw = imuWrap180(imuYaw + wYaw * dt);
 
-  // ---- v7.14.0 侧向 / 纵向 G ----
-  // 加速度计测的是比力，水平加速时 |f|² = a_h² + 1，所以 a_h = sqrt(|f|²-1)；
-  // 再减掉纵向分量，剩下的就是侧向，稳态压弯时恒等于 tan(φ)：45° → 1.00G。
-  // 但 latA 有个致命盲区：**静止倾斜时它恒等于 0**。|f| 在静止时恒为 1g（不管车怎么歪），
-  // latSq = 1-1-0 = 0 —— 物理上没错（静态倾斜确实没有横向加速度），可用户侧倾车身时
-  // 球就一动不动。v7.14.3 之前的判据用 |lonNow|（纵向加速）来切换到 latB，判据选错了对象：
-  // 静止倾斜时 lonNow≈0 → wA=1 → 永远只用 latA=0，latB 一次都没用上。
-  // v7.14.4 改成按 |f| 偏离 1g 的多少来混合：
-  //   |f| 明显 > 1g（真在压弯/加速）→ latA 是实测真值，优先
-  //   |f| ≈ 1g（静止倾斜 / 直线）    → latB = tan(roll)，歪多少显示多少
-  // 稳态压弯时两者完全相等（latA = latB = tan φ），所以这个切换不改变压弯精度。
-  const float latA = latSq > 0.0f ? sqrtf(latSq) : 0.0f;
-  // v7.14.5 latB 必须用**相对倾角**（减掉 imuBiasRoll），跟屏幕上那个 LEAN 数字保持一致。
-  //   之前直接用绝对 imuRoll：只要板子装得有一点横滚偏置（或者用户点屏归过零），
-  //   LEAN 显示 0.0 而球却按绝对倾角跑 —— 静止时 G 显示 tan(52°)=1.3、球死死顶在 RIGHT，
-  //   就是这个原因。屏幕上两个数字必须来自同一个角度。
-  const float rollRel = imuWrap180(imuRoll - imuBiasRoll);
-  const float latB = tanf(constrain(rollRel * 0.017453293f, -1.1f, 1.1f));
-  imuRollRel = rollRel; imuLatBDbg = latB;
-  // 直线骑行时车身本来就有 ±1° 的微摆（路面横坡、把手的微修正），tan(1°)≈0.017 正好卡在
-  // 显示死区 0.02 边上，会让球在直线上抖。3° 以下按比例降权（3° 以上全信，对应 0.05G 以上，
-  // 早就在死区之上了），所以不影响真正的压弯和桌面倾斜测试。
-  const float bTrust = constrain((fabsf(rollRel) - 1.0f) / 2.0f, 0.0f, 1.0f);
-  float wA = constrain((imuG - 1.0f) / 0.03f, 0.0f, 1.0f);                    // |f|>1.03 才完全信实测
-  wA *= constrain(1.0f - (fabsf(lonNow) - 0.20f) / 0.25f, 0.0f, 1.0f);        // 纵向加速大时 lonNow 不可靠
-  const float latRaw = (wA * latA + (1.0f - wA) * fabsf(latB) * bTrust) * imuLeanSign * G_LEAN_SIGN;
-  const float kd = dt / (0.09f + dt);                                // 90ms 显示平滑
-  imuLatG += (latRaw - imuLatG) * kd;
-  imuLonG += (lonNow - imuLonG) * kd;
+  // ---- 侧向 / 纵向 G：三轴比力过 EMA（α=0.015）后按相对 roll/pitch 旋平 ----
+  // 稳态压弯时 lat = tanφ；刹车 / 加速时 lon 带符号；静止倾斜时恒为 0。
+  if (!imuEmaInit) {
+    imuEmaR = aR; imuEmaF = aF; imuEmaU = aU;
+    imuEmaInit = true;
+  } else {
+    const float alpha = 0.015f;                                        // chrono-g 的 ema_alpha_accel
+    imuEmaR += (aR - imuEmaR) * alpha;
+    imuEmaF += (aF - imuEmaF) * alpha;
+    imuEmaU += (aU - imuEmaU) * alpha;
+  }
   {
+    const float phR = imuWrap180(imuRoll - imuBiasRoll) * 0.017453293f;
+    const float thR = imuWrap180(imuPitch - imuBiasPitch) * 0.017453293f;
+    const float upE = imuEmaF * sinf(thR) + imuEmaU * cosf(thR);       // 去俯仰后的竖直分量
+    imuLonG = imuEmaF * cosf(thR) - imuEmaU * sinf(thR);               // 纵向（水平前向）
+    imuLatG = imuEmaR * cosf(phR) + upE * sinf(phR);                   // 侧向（水平右向）
     const float m = sqrtf(imuLatG * imuLatG + imuLonG * imuLonG);
     if (m > imuPeakG) imuPeakG = m;
   }
+  imuRollRel = imuWrap180(imuRoll - imuBiasRoll);                      // 调试小字仍要用
 }
 // v7.13.3 G 值表（gg 图）：黑底 + 蓝色分段弧刻度（1.0g 内圈 / 1.5g 外圈）+ 黄绿 G 矢量圆点 + 中央合 G 数字。
 // v7.13.7 边缘黄圈重做：贴屏边（r229）、静止 10px 厚 / 亮度 140，底部留缺口给翻页点。
-// v7.13.8 黄圈随 G 向内扩长（10 → 34px）并把颜色从黄推到橙再推到红；矢量点跟着同一个颜色走。
-// v7.14.0 算法重做：侧向/纵向 G 改在 imuTick 里按 dt 归一计算，压弯时不再是 0.00G；点屏幕重置零点和峰值。
-// v7.14.2 边缘环改扫描线面积填充，彻底消掉环上的黑色针孔。
+// v7.13.8 黄圈随 G 向内扩长（10 → 34px）并把颜色从黄推到橙再推到红，矢量点跟着同一个颜色走；
+//          边缘环改扫描线面积填充消掉针孔；G 值算法照抄 TioRuben/chrono-g，在 imuTick 里算好、
+//          绘制层只读，点屏幕重置零点和峰值。
 static void imuArcSeg(float cx, float cy, float r, float a0, float a1, uint16_t c, float step = 3.0f) {
   const float D = 0.017453293f;
   float px = cx + cosf(a0 * D) * r, py = cy + sinf(a0 * D) * r;
@@ -1566,7 +1552,7 @@ static void imuArcSeg(float cx, float cy, float r, float a0, float a1, uint16_t 
     px = nx; py = ny; a = na;
   }
 }
-// v7.14.2 边缘环改成"扫描线面积填充"。
+// v7.13.8 边缘环改成"扫描线面积填充"。
 //   病根：1px 的圆（drawCircle 中点法）在 45° 方向天然留棋盘格针孔；之前用 6° 一段的折线（弦）
 //   也一样 —— 相邻半径的 Bresenham 阶梯互相对不齐，34 圈叠起来针孔还对得整整齐齐。实测环带
 //   内有 12%~15% 的像素是纯黑，屏幕上就是一圈圈"黑色空隙"。把折线步长改细（1°/0.5°）只会让
@@ -1596,21 +1582,9 @@ void drawImuPage(){
   const uint16_t C_GBLUE = 0x3CFF;   // 刻度蓝（边缘黄圈的颜色见下面 ringCol）
   if(!imuOK){ printCentered("QMI8658 NOT FOUND",CX,190,2,C_RED); drawPageDots(); needFlush=true; return; }
   const float cyG = 233;                           // v7.13.4 仪表几何居中（画布中心）
-  // ---- v7.14.6 还原成基线 v7.13.1 的做法：在绘制层把比力按 roll/pitch 反旋到水平系 ----
-  // 基线是用原始 imuAx/imuAy/imuAz 直接投影，这里保留完全一样的思路，只把轴换成修正后的
-  // 车身坐标（右/前/上）—— 否则纵向会取到横向轴，就是"球只往 RIGHT 走"那个老问题。
-  // 符号按车身坐标重新推过：静止侧倾 φ 时 lat ≡ 0；稳态压弯时 lat ≡ tan φ
-  // （基线原来那一项是 `- z1·sin(φ)`，符号反了，所以压弯时侧向 G 一直是 0）。
-  const float phR = imuWrap180(imuRoll - imuBiasRoll) * 0.017453293f;
-  const float thR = imuWrap180(imuPitch - imuBiasPitch) * 0.017453293f;
-  const float lonRaw = imuBodyF * cosf(thR) - imuBodyU * sinf(thR);    // 纵向（水平前向）
-  const float upRaw  = imuBodyF * sinf(thR) + imuBodyU * cosf(thR);    // 去俯仰后的竖直分量
-  const float latRaw = imuBodyR * cosf(phR) + upRaw * sinf(phR);       // 侧向（水平右向）
-  static float sLat = 0, sLon = 0;                 // 与基线一致的 0.35 一阶平滑
-  sLat += (latRaw - sLat) * 0.35f;
-  sLon += (lonRaw - sLon) * 0.35f;
+  // 绘制层只读：G 值和峰值都在 imuTick 里算好。
+  const float sLat = imuLatG, sLon = imuLonG;
   float mag = sqrtf(sLat * sLat + sLon * sLon);
-  if (mag > imuPeakG) imuPeakG = mag;
   if (mag < 0.02f) mag = 0.0f;                     // 静止死区：末位不再在 0.00/0.01 之间乱跳
   {                                                // 显示滞环：变化不到半个末位就不重画，消掉抖字
     static float shownMag = -1.0f;
@@ -1640,7 +1614,7 @@ void drawImuPage(){
     const float gk = constrain(mag / 1.5f, 0.0f, 1.0f);
     const int thick = 10 + (int)(gk * gk * 34.0f + 0.5f);   // 二次曲线：常用倾角保持细，接近满量程才迅速加厚
     const int bright = 140 + (int)(gk * 115.0f + 0.5f);
-    // v7.14.2 分 16 带扫描填充（带内同色、带间只差 1~2 个 565 阶，看上去还是连续渐变）。
+    // v7.13.8 分 16 带扫描填充（带内同色、带间只差 1~2 个 565 阶，看上去还是连续渐变）。
     //          单带宽度 2~3px，所以"外缘最亮、每向内 1px 减 3"的效果基本保留。
     const int bands = 16;
     for (int k = 0; k < bands; k++) {
@@ -1675,7 +1649,7 @@ void drawImuPage(){
 #if IMU_SHOW_AXES
   snprintf(b, sizeof(b), "F%+5.2f R%+5.2f U%4.2f", imuBodyF, imuBodyR, imuBodyU);
   printCentered(b, CX, cyG + 168, 1, 0x630C);
-  snprintf(b, sizeof(b), "RLL%+6.1f LATB%+5.2f", imuRollRel, imuLatBDbg);
+  snprintf(b, sizeof(b), "RLL%+6.1f LAT%+5.2f", imuRollRel, imuLatG);
   printCentered(b, CX, cyG + 180, 1, 0x630C);
 #endif
   // ---- G 矢量圆点（限幅 1.5g 内；最后画，浮在数字上面。sLat = 侧向，sLon = 纵向）----
@@ -3285,7 +3259,7 @@ void setup() {
   backlightPWM=ledcAttach(LCD_BL,20000,8);
   Wire.begin(IIC_SDA, IIC_SCL);
   imuOK=imu.begin(Wire,0x6B,IIC_SDA,IIC_SCL); if(!imuOK) imuOK=imu.begin(Wire,0x6A,IIC_SDA,IIC_SCL);
-  if(imuOK){ imu.configAccel(SensorQMI8658::AccelRange::FS_8G,SensorQMI8658::AccelODR::ODR_112Hz,SensorQMI8658::LpfMode::MODE_1); imu.configGyro(SensorQMI8658::GyroRange::FS_512DPS,SensorQMI8658::GyroODR::ODR_112Hz,SensorQMI8658::LpfMode::MODE_3); imu.enableAccel(); imu.enableGyro(); }   // v7.14.0 打开片上 LPF：加速度 3.63%（≈4Hz，压 G 值噪声），陀螺 13.37%（≈15Hz，少一点积分滞后）
+  if(imuOK){ imu.configAccel(SensorQMI8658::AccelRange::FS_8G,SensorQMI8658::AccelODR::ODR_112Hz,SensorQMI8658::LpfMode::MODE_1); imu.configGyro(SensorQMI8658::GyroRange::FS_512DPS,SensorQMI8658::GyroODR::ODR_112Hz,SensorQMI8658::LpfMode::MODE_3); imu.enableAccel(); imu.enableGyro(); }   // v7.13.8 打开片上 LPF：加速度 3.63%（≈4Hz，压 G 值噪声），陀螺 13.37%（≈15Hz，少一点积分滞后）
   touchInit();                                         // v5.2 触摸屏
   batInit();                                           // v6.8 电源芯片（电量）
 
