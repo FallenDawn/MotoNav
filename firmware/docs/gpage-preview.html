@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MotoNav G 值页 · 绘制对比</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0d10; color: #cfd6e4;
+         font: 13px/1.6 "Segoe UI", system-ui, sans-serif; padding: 18px 22px 28px; }
+  h1 { font-size: 17px; font-weight: 600; margin: 0 0 4px; color: #e8edf7; }
+  .sub { color: #7c8698; margin-bottom: 16px; }
+  .row { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .card { background: #12151a; border: 1px solid #222833; border-radius: 14px; padding: 10px 12px 12px; flex: 0 0 auto; }
+  .cap { font-size: 12px; color: #9aa4b6; margin: 8px 2px 0; text-align: center; }
+  .cap b { color: #e8edf7; font-weight: 600; }
+  canvas { display: block; background: #000; border-radius: 50%; }
+</style>
+</head>
+<body>
+<h1>MotoNav 1.85B · G 值页绘制对比</h1>
+<div class="sub">逻辑画布 466 → 面板 360 最近邻缩放 · 边缘黄圈随 G 向内扩长 10→34px，颜色 黄 → 橙 → 红</div>
+<div class="row" id="row"></div>
+<script>
+const CX = 233, CYC = 233;
+const BLACK = 0x0000, WHITE = 0xFFFF, GREY = 0x7BEF, ORANGE = 0xFBC3, RED = 0xF800;
+const YELLOW = 0xF623;     // C_YELLOW
+const CHART = 0xCEA0;      // v7.13.7 及以前的黄绿
+const GBLUE = 0x3CFF;
+const DIMTXT = 0x630C;
+
+function u565(c) {
+  const r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+  return [Math.round(r * 255 / 31), Math.round(g * 255 / 63), Math.round(b * 255 / 31)];
+}
+function to565(r, g, b) {
+  return ((Math.round(r * 31 / 255) << 11) | (Math.round(g * 63 / 255) << 5) | Math.round(b * 31 / 255));
+}
+function blend(a, b, t) {              // 与固件 blend565(a,b,t) 一致
+  t = Math.max(0, Math.min(255, t | 0));
+  const A = u565(a), B = u565(b);
+  return to565(A[0] + (B[0] - A[0]) * t / 255, A[1] + (B[1] - A[1]) * t / 255, A[2] + (B[2] - A[2]) * t / 255);
+}
+function css(c) { const p = u565(c); return `rgb(${p[0]},${p[1]},${p[2]})`; }
+
+function makeCanvas(w, h) { const cv = document.createElement('canvas'); cv.width = w; cv.height = h; return cv; }
+function newCtx(logical = 466) {
+  const cv = makeCanvas(logical, logical);
+  const g = cv.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, logical, logical);
+  return { cv, g, s: logical / 466 };
+}
+function circle(g, x, y, r, col) {
+  g.beginPath(); g.arc(x * g.__s, y * g.__s, Math.max(0.4, r * g.__s), 0, Math.PI * 2);
+  g.fillStyle = css(col); g.fill();
+}
+function disc(g, x, y, r, col) { circle(g, x, y, r, col); }
+function ring(g, x, y, r, col) {          // 与固件 drawCircle 一致：1px 描边圆
+  g.beginPath(); g.arc(x * g.__s, y * g.__s, Math.max(0.4, r * g.__s), 0, Math.PI * 2);
+  g.strokeStyle = css(col); g.lineWidth = Math.max(0.7, 1 * g.__s); g.stroke();
+}
+function line(g, x0, y0, x1, y1, col, w = 1) {
+  g.beginPath(); g.moveTo(x0 * g.__s, y0 * g.__s); g.lineTo(x1 * g.__s, y1 * g.__s);
+  g.strokeStyle = css(col); g.lineWidth = Math.max(0.6, w * g.__s); g.stroke();
+}
+// v7.14.2 与固件 ringBand() 等价：薄圆环用面积填充（even-odd），不再逐圈描边。
+// 逐圈 drawCircle 在 45° 方向天然留棋盘格针孔，环里 12%~15% 的像素是纯黑 —— 就是"黑色空隙"。
+function bandRing(g, x, y, rOut, rIn, col) {
+  const s = g.__s;
+  if (rIn < 0) rIn = 0;
+  if (rIn >= rOut) return;
+  g.beginPath();
+  g.arc(x * s, y * s, rOut * s, 0, Math.PI * 2, false);
+  if (rIn > 0) {
+    g.moveTo((x + rIn) * s, y * s);                       // 断开子路径，避免径向连线留毛刺
+    g.arc(x * s, y * s, rIn * s, 0, Math.PI * 2, true);
+  }
+  g.fillStyle = css(col);
+  g.fill(rIn > 0 ? 'evenodd' : 'nonzero');
+}
+// 固件 printCentered：每个字符 6*size 宽，8*size 高，y 是文字顶
+function text(g, str, cx, y, size, col) {
+  const cw = 6 * size, h = 8 * size;
+  g.save();
+  g.font = `600 ${h * 0.98 * g.__s}px "Consolas", monospace`;
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  g.fillStyle = css(col);
+  for (let i = 0; i < str.length; i++) g.fillText(str[i], (cx - str.length * cw / 2 + cw * (i + 0.5)) * g.__s, y * g.__s);
+  g.restore();
+}
+// 与固件 imuArcSeg 一致：a0 → a1，step 度一段，末段收到 a1
+function arcSeg(g, cx, cy, r, a0, a1, col, step = 3) {
+  const D = Math.PI / 180;
+  g.beginPath();
+  for (let a = a0; a < a1 - 0.01; a += step) {
+    const na = Math.min(a + step, a1);
+    g.moveTo((cx + Math.cos(a * D) * r) * g.__s, (cy + Math.sin(a * D) * r) * g.__s);
+    g.lineTo((cx + Math.cos(na * D) * r) * g.__s, (cy + Math.sin(na * D) * r) * g.__s);
+  }
+  g.strokeStyle = css(col); g.lineWidth = Math.max(0.8, 1 * g.__s); g.stroke();
+}
+
+// ---------- v7.13.7 及以前 ----------
+function drawOld(g, st) {
+  g.__s = 1;
+  const cyG = 233, mag = st.mag, sLat = st.sLat, sLon = st.sLon;
+  for (let k = 0; k < 2; k++) for (let s = 0; s < 4; s++) {
+    arcSeg(g, CX, cyG, k ? 176 : 118, 14 + s * 90, 76 + s * 90, GBLUE);
+    arcSeg(g, CX, cyG, (k ? 176 : 118) - 1, 14 + s * 90, 76 + s * 90, GBLUE);
+  }
+  for (let s = 0; s < 4; s++) {
+    const a = s * 90 * Math.PI / 180;
+    line(g, CX + Math.cos(a) * 52, cyG + Math.sin(a) * 52, CX + Math.cos(a) * 64, cyG + Math.sin(a) * 64, GBLUE);
+  }
+  const glowT = Math.max(4, Math.min(10, 4 + Math.floor(mag * 4)));
+  const glowC = Math.max(60, Math.min(255, 60 + Math.floor(mag * 150)));
+  for (let i = 0; i < glowT; i++)
+    ring(g, CX, cyG, 205 - i, blend(BLACK, CHART, Math.max(30, glowC - i * 14)));
+  text(g, 'FRONT', CX, cyG - 162, 2, GBLUE);
+  text(g, 'REAR', CX, cyG + 148, 2, GBLUE);
+  text(g, 'LEFT', CX - 150, cyG - 8, 2, GBLUE);
+  text(g, 'RIGHT', CX + 150, cyG - 8, 2, GBLUE);
+  text(g, '0.5', CX, cyG - 70, 1, DIMTXT);
+  text(g, '1.0', CX, cyG - 128, 1, DIMTXT);
+  const vc = mag < 0.5 ? WHITE : (mag < 1.0 ? ORANGE : RED);
+  text(g, mag.toFixed(2) + 'G', CX, cyG - 24, 5, vc);
+  text(g, 'LEAN ' + (st.lean >= 0 ? '+' : '-') + Math.abs(st.lean).toFixed(1).padStart(4, '0') + ' deg', CX, cyG + 34, 2, GREY);
+  const dl = Math.hypot(sLat, sLon), mk = dl > 1.5 ? 1.5 / dl : 1;
+  disc(g, CX + sLat * mk * 118, cyG - sLon * mk * 118, 17, CHART);
+  for (let i = 0; i < 5; i++) disc(g, CX + (i - 2) * 20, 444, 4, i === 3 ? WHITE : 0x4208);
+}
+
+// ---------- v7.13.8 ----------
+function drawNew(g, st) {
+  g.__s = 1;
+  const cyG = 233, mag = st.mag, sLat = st.sLat, sLon = st.sLon;
+  // 1. 边缘黄圈：贴边 r229，厚度 10 → 44（二次曲线）、亮度 140 → 255 随 G 向内扩长；黄 → 橙(0.7g) → 红(1.3g)
+  const gk = Math.min(1, mag / 1.5);
+  const thick = 10 + Math.round(gk * gk * (window.THK || 34)), bright = 140 + Math.round(gk * 115);
+  const ringCol = mag <= 0.7 ? blend(YELLOW, ORANGE, mag * 364)
+                : mag <= 1.3 ? blend(ORANGE, RED, (mag - 0.7) * 425)
+                : RED;
+  // v7.14.2 分 16 带扫描填充（等价固件 ringBand），环上针孔为 0；带间亮度只差 1~2 个 565 阶
+  const bands = 16;
+  for (let k = 0; k < bands; k++) {
+    const i0 = Math.floor(k * thick / bands);
+    let i1 = Math.floor((k + 1) * thick / bands) - 1;
+    if (i1 < i0) i1 = i0;
+    const ro = 229 - i0, ri = ro - (i1 - i0 + 1);
+    const imid = i0 + Math.floor((i1 - i0) / 2);
+    bandRing(g, CX, cyG, ro, ri, blend(BLACK, ringCol, Math.max(40, bright - imid * 3)));
+  }
+  // 底部 28° 缺口（±14°，tan14°=0.2493），逐行擦除，与固件一致
+  g.fillStyle = '#000';
+  for (let y = cyG; y < 466; y++) {
+    const half = Math.floor((y - cyG) * 0.2493);
+    if (half > 0) g.fillRect((CX - half) * g.__s, y * g.__s, (half * 2 + 1) * g.__s, Math.max(1, g.__s));
+  }
+  // 2. 刻度：1.0g / 1.5g 分段弧 + 0.5g 短线
+  for (let kk = 0; kk < 2; kk++) for (let s = 0; s < 4; s++) {
+    arcSeg(g, CX, cyG, kk ? 176 : 118, 14 + s * 90, 76 + s * 90, GBLUE);
+    arcSeg(g, CX, cyG, (kk ? 176 : 118) - 1, 14 + s * 90, 76 + s * 90, GBLUE);
+  }
+  for (let s = 0; s < 4; s++) {
+    const a = s * 90 * Math.PI / 180;
+    line(g, CX + Math.cos(a) * 52, cyG + Math.sin(a) * 52, CX + Math.cos(a) * 64, cyG + Math.sin(a) * 64, GBLUE);
+  }
+  text(g, 'FRONT', CX, cyG - 162, 2, GBLUE);
+  text(g, 'REAR', CX, cyG + 148, 2, GBLUE);
+  text(g, 'LEFT', CX - 150, cyG - 8, 2, GBLUE);
+  text(g, 'RIGHT', CX + 150, cyG - 8, 2, GBLUE);
+  text(g, '0.5', CX, cyG - 70, 1, DIMTXT);
+  text(g, '1.0', CX, cyG - 128, 1, DIMTXT);
+  // 3. 中央合 G 数字（矢量点画在数字上面，所以数字先画）
+  const vc = mag < 0.5 ? WHITE : (mag < 1.0 ? ORANGE : RED);
+  text(g, mag.toFixed(2) + 'G', CX, cyG - 24, 5, vc);
+  text(g, 'LEAN ' + (st.lean >= 0 ? '+' : '-') + Math.abs(st.lean).toFixed(1).padStart(4, '0') + ' deg', CX, cyG + 34, 2, GREY);
+  // 4. G 矢量圆点：118 px/g，限幅 1.5g，跟黄圈同色
+  const dl = Math.hypot(sLat, sLon), mk = dl > 1.5 ? 1.5 / dl : 1;
+  disc(g, CX + sLat * mk * 118, cyG - sLon * mk * 118, 17, ringCol);
+  // v7.14.3 调轴小字（固件里由 IMU_SHOW_AXES 控制）
+  text(g, 'F+0.30 R-0.02 U1.00', CX, cyG + 172, 1, 0x630C);
+  for (let i = 0; i < 5; i++) disc(g, CX + (i - 2) * 20, 444, 4, i === 3 ? WHITE : 0x4208);
+}
+
+// ---------- 出图 ----------
+const SCENES = [
+  { name: '静止 0.03G', which: 'old', mag: 0.03, sLat: 0.02, sLon: 0.02, lean: 0.0 },
+  { name: '静止 0.03G', which: 'new', mag: 0.03, sLat: 0.02, sLon: 0.02, lean: 0.0 },
+  { name: '压弯 0.40G', which: 'new', mag: 0.40, sLat: 0.38, sLon: 0.12, lean: 21.0 },
+  { name: '压弯 0.70G', which: 'new', mag: 0.70, sLat: 0.68, sLon: 0.16, lean: 35.0 },
+  { name: '压弯 1.05G', which: 'new', mag: 1.05, sLat: 1.03, sLon: 0.20, lean: 46.0 },
+  { name: '极限 1.40G', which: 'new', mag: 1.40, sLat: 1.36, sLon: 0.33, lean: 55.0 },
+];
+
+function panel(sc, phys) {
+  const { cv, g } = newCtx(466);
+  (sc.which === 'old' ? drawOld : drawNew)(g, sc);
+  const out = makeCanvas(phys, phys);
+  const o = out.getContext('2d');
+  o.imageSmoothingEnabled = false;                 // 与 portScale 最近邻一致
+  o.drawImage(cv, 0, 0, phys, phys);
+  return out;
+}
+
+const row = document.getElementById('row');
+const q = new URLSearchParams(location.search);
+window.THK = +(q.get('thk') || 24);
+if (q.get('one')) {
+  // 单图放大：?one=new|old&mag=0.7&px=466
+  const mag = +(q.get('mag') || 0.03);
+  const sc = { mag, sLat: mag * 0.96, sLon: mag * 0.26, lean: Math.asin(Math.min(1, mag)) * 57.3 };
+  const px = +(q.get('px') || 466);
+  const { cv, g } = newCtx(466);
+  (q.get('one') === 'old' ? drawOld : drawNew)(g, sc);
+  const out = makeCanvas(px, px);
+  const o = out.getContext('2d');
+  o.imageSmoothingEnabled = false;
+  o.drawImage(cv, 0, 0, px, px);
+  document.body.style.padding = '0';
+  document.querySelectorAll('h1,.sub').forEach(e => e.remove());
+  row.appendChild(out);
+} else {
+  for (const sc of SCENES) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.appendChild(panel(sc, 360));
+    const cap = document.createElement('div');
+    cap.className = 'cap';
+    cap.innerHTML = `<b>${sc.name}</b> · ${sc.which === 'old' ? 'v7.13.7' : 'v7.13.8'}`;
+    card.appendChild(cap);
+    row.appendChild(card);
+  }
+}
+</script>
+</body>
+</html>

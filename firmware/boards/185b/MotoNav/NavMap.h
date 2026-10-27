@@ -7,10 +7,6 @@
 #include "MotoNavCommon.h"
 
 // ===== 导航与行车状态（写入口：handleText，见 MotoNav.cpp）=====
-// 三阶段的分界距离（米）
-#define STAGE_FAR_M  500   // 超过这个距离：远处预告画面
-#define STAGE_NEAR_M 100   // 小于等于这个距离：橙色警示
-
 extern bool inNav;                 // 是否处于导航中
 extern String navDir;              // 当前方向
 extern int navDist;                // 当前距离（米）
@@ -31,6 +27,10 @@ extern int tripRemainM, tripEta, tripLights;   // v3.1 行程信息（"#e"）
 // 初版实时路况提醒：手机根据高德路线计算后发送 #TR,等级,前方距离,覆盖长度
 extern int trafficAlertLevel, trafficAlertDist, trafficAlertSpan;
 extern unsigned long trafficAlertAt;
+// v7.13.5 前方拥堵提醒是否该显示：等级够 + 90 秒内刷新过。
+// nearOnly = true 时再加 1.5km 距离门槛（地图页外圈、JAM banner 用）；
+// 大箭头页没有地图和路线，外圈是唯一提示，不受距离限制
+bool trafficAlertOn(bool nearOnly = true);
 
 // v7.3 路程进度
 extern bool progOn;
@@ -64,6 +64,7 @@ extern bool nightOn;               // v3.0 夜间配色（"#n,1/0"）
 extern int trailMode;              // v3.0 走过的路线：1 变灰，2 擦除（"#r,1/2"）
 extern bool bld3dOn;               // v7.13 3D 楼块显示开关（"#B3D,0/1"）
 extern bool mapOn;                 // "#m,1/0" 小地图开/关
+extern bool forceArrow;            // v7.13.6 "#m,2" 强制大箭头页（地图数据照收，只切显示）
 
 // ===== 当前位置（"#p"，写入口 handleText）=====
 extern int posFrame;
@@ -107,7 +108,7 @@ void loadBackground();             // 独立圆屏背景图（SPIFFS）
 void drawBackground();
 void drawRedRing();                // 屏幕边缘的红圈（断线、数据中断）
 void handleBulk(const uint8_t *d, int n);   // 'M' 大块数据（地图块/路线/原路线/背景）
-// 接收链路已确认，默认关闭详细分片日志（NavMap.cpp 里另有同名定义，内容一致）
+// 接收链路已确认，默认关闭详细分片日志；主文件和 NavMap.cpp 共用
 #define MAP_RX_LOG(...) do {} while (0)
 bool mapModeActive();              // 现在是否显示小地图
 float tripFrac();                  // v7.4 路程进度 0~1；不显示时 -1

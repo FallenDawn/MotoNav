@@ -40,13 +40,14 @@
 #define BOTTOM_Y     372   // 底部信息图片顶部（常驻显示）
 #define TEXT_R       200   // 文字必须在这个半径以内（圆环内沿约 215）
 
-// 页面槽位：负一屏音乐，第一屏主页/导航，第二屏 IMU，第三屏天气。
+// 页面从左到右：音乐、胎压、主页/导航、IMU、天气。
 // 使用连续的内部编号，便于滑动动画和边界判断；不要把 PAGE_MUSIC 当成主页。
 enum MotoNavPage : uint8_t {
   PAGE_MUSIC = 0,
-  PAGE_HOME = 1,
-  PAGE_IMU = 2,
-  PAGE_WEATHER = 3,
+  PAGE_TPMS = 1,
+  PAGE_HOME = 2,
+  PAGE_IMU = 3,
+  PAGE_WEATHER = 4,
 };
 
 // 先画在内存里的“画布”上，画完再一次性推到屏幕（需要 PSRAM：OPI PSRAM）

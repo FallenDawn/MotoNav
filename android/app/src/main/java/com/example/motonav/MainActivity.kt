@@ -701,7 +701,13 @@ class MainActivity : AppCompatActivity() {
 
     /** 圆屏显示：小地图开关、风格、夜间配色、清爽模式、行程环、弯道上色、走过的路线、预判 */
     private fun mapSection(card: LinearLayout) {
-        card.addView(settingRow("显示小地图", "关掉后圆屏只显示大箭头", toggle({ MapFeeder.enabled }) { MapFeeder.setEnabled(it) }))
+        // v7.14 显示模式：只切圆屏画什么，不影响底图下载（固件 "#m,2"）
+        card.addView(subhead("显示模式", top = 2))
+        card.addView(segmented(listOf(0 to "小地图", 1 to "大箭头"),
+            { if (MapFeeder.arrowOnly) 1 else 0 }) { MapFeeder.setArrowOnly(it == 1) })
+        card.addView(note("选「大箭头」：圆屏只画转弯和距离，不画地图；底图照常下载，切回来立刻就有。"))
+        card.addView(divider())
+        card.addView(settingRow("下载地图", "关掉后不再下载底图（省流量），圆屏也只显示大箭头", toggle({ MapFeeder.enabled }) { MapFeeder.setEnabled(it) }))
         card.addView(divider())
         // v6.0 风格：右边小预览图，点「更换」打开全屏风格卡片
         val themeSub = label("", 12f, SUB)
@@ -751,7 +757,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun mapSummary(): String =
         if (!MapFeeder.enabled) "小地图已关闭，只显示大箭头"
-        else MapFeeder.themeName() + " · " + (if (MapFeeder.nightNow) "夜间" else "白天") + "配色" +
+        else (if (MapFeeder.arrowOnly) "大箭头（底图仍在下载）" else MapFeeder.themeName()) + " · " +
+            (if (MapFeeder.nightNow) "夜间" else "白天") + "配色" +
             (if (MapFeeder.clean) " · 清爽" else "") + (if (MapFeeder.progress) " · 进度环" else "")
 
     /** v3.8 导航语音：高德自带 / 手机系统语音（可选引擎、声音、语速、音调、试听）；v4.1 推荐免费 AI 语音引擎 */

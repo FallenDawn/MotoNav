@@ -96,6 +96,9 @@ object MapFeeder {
 
     @Volatile var enabled = true
         private set
+    /** v7.14 圆屏只显示大箭头：底图照常下载，只是不画（固件 "#m,2"；旧固件会当成 #m,1） */
+    @Volatile var arrowOnly = false
+        private set
     @Volatile var clean = false                // v4.8 清爽模式：地图保留，去掉红绿灯、电子眼等
         private set
     @Volatile var status = "（还没开始）"
@@ -269,6 +272,7 @@ object MapFeeder {
         ctx = context.applicationContext
         val sp = ctx!!.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         enabled = sp.getBoolean("map_on", true)
+        arrowOnly = sp.getBoolean("map_arrow_only", false)
         buildingEnabled=sp.getBoolean("map_buildings",true)
         building3dEnabled=sp.getBoolean("map_bld3d",true)
         source = sp.getInt("map_src", SRC_AUTO)
@@ -445,7 +449,17 @@ object MapFeeder {
         enabled = on
         AmapCaptureHost.refresh()
         ctx?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putBoolean("map_on", on)?.apply()
-        BleLink.send(if (on) "#m,1" else "#m,0")
+        BleLink.send(mapModeCommand())
+    }
+
+    /** 圆屏显示模式对应的 "#m" 指令：0 关小地图 / 1 小地图 / 2 强制大箭头（底图照收，旧固件当 1） */
+    private fun mapModeCommand() = when { !enabled -> "#m,0"; arrowOnly -> "#m,2"; else -> "#m,1" }
+
+    /** v7.14 圆屏显示：小地图 / 大箭头。只切显示，底图照常下载，切回来立刻就有 */
+    fun setArrowOnly(on: Boolean) {
+        arrowOnly = on
+        ctx?.getSharedPreferences(PREFS, Context.MODE_PRIVATE)?.edit()?.putBoolean("map_arrow_only", on)?.apply()
+        BleLink.send(mapModeCommand())
     }
 
     /** 新的一次导航：路线清空（地图块保留，位置附近的地图还能用） */
@@ -849,7 +863,7 @@ object MapFeeder {
         BleLink.sendEvent("#GB?")
         handler.post {
             BleLink.send(if (building3dEnabled) "#B3D,1" else "#B3D,0")   // v7.13 3D 楼块开关（旧固件忽略）
-            BleLink.send(if (enabled) "#m,1" else "#m,0")
+            BleLink.send(mapModeCommand())
             BleLink.send("#t,$theme")                    // v2.5 配色主题
             BleLink.send("#r,$trail")                    // v2.8 走过的路线
             BleLink.send(if (clean) "#w,1" else "#w,0")   // v4.8 清爽模式

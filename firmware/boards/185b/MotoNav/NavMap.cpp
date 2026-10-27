@@ -11,6 +11,10 @@
 #include "MotoNavCommon.h"
 #include "NavMap.h"
 
+// 三阶段的分界距离（米），可按需要调整
+#define STAGE_FAR_M  500   // 超过这个距离：远处预告画面
+#define STAGE_NEAR_M 100   // 小于等于这个距离：橙色警示
+
 // RGB565 混合（t: 0~256，256 = 全是 b）；栅格地图和路线描边用
 uint16_t blendF(uint16_t a, uint16_t b, uint32_t t) {
   uint32_t ar = a >> 11, ag = (a >> 5) & 63, ab = a & 31;
@@ -51,7 +55,6 @@ unsigned long trafficAlertAt = 0;
 
 // ================= NavMap 段 04（源 MotoNav.cpp 484-496 行） =================
 
-#include "TripProgress.h"
 TripProgress tripProgress;
 bool progOn = true;
 long progDone = 0;                   // 这趟已经走掉的里程（米）
@@ -67,7 +70,6 @@ volatile unsigned long lightCdAt = 0;
 // ================= NavMap 段 05（源 MotoNav.cpp 497-507 行） =================
 
 // v3.5 小地图上的电子眼（手机发 "#c,坐标系,x,y,限速,类型,..."，最多 6 个）
-#define MCAM_MAX 10           // v4.8 6 → 10（电子眼 + 道路安全提示）
 int mapCamN = 0, mapCamFrame = -1;
 int32_t mapCamX[MCAM_MAX], mapCamY[MCAM_MAX];
 int mapCamSpd[MCAM_MAX];
@@ -691,7 +693,6 @@ String ringDir = "";
 
 // v2.9 地图配色主题；v3.0 加上“走过的路线”颜色（done 内芯、done2 描边）和夜间配色
 struct MapTheme { uint16_t block, road, park, water, route, route2, hud, blip, done, done2; };
-#define THEME_N 12
 const MapTheme THEMES[THEME_N] = {
   {0xDEFB, 0x3186, 0x5DEB, 0x4C9B, 0xA21E, 0x58F1, 0xFFFF, 0xFE80, 0x94B3, 0x5AEC},   // 0 原版
   {0xE6D9, 0x3187, 0x760D, 0x4E3B, 0xF258, 0x78EC, 0x6F5F, 0xF258, 0xA4B4, 0x62CC},   // 1 罪恶都市：暖沙色街区、青绿水面、粉紫路线
@@ -759,7 +760,6 @@ Bulk bulks[6];              // 1~4 地图/路线；5 = 独立圆屏背景图
 uint16_t *backgroundPixels = nullptr;
 int backgroundW = 0, backgroundH = 0;
 bool backgroundValid = false;
-void drawBackground();
 
 // ---- v4.4 原路线（导入的高德分享路线）：导航时画成一条淡色细线，走错路时能看到原来该走哪 ----
 #define GHOST_PTS 6000
@@ -769,7 +769,6 @@ int ghostN = 0, ghostFrame = -1;
 
 // ---- v2.5 图片地图（天地图）----
 #include "RasterContinuity.h"
-#define MAP_RX_LOG(...) do {} while (0)  // 接收链路已确认，默认关闭详细分片日志
 // 建筑物像素普查只服务诊断日志：最多要全扫 ~1.7M 像素，收图时会把渲染主循环卡住几十上百毫秒。
 // 默认关闭；要核查建筑物数据时改成 1 再编译。
 #define MAP_BLD_LOG 0
@@ -819,7 +818,6 @@ float routeProg = -1;             // v3.0 车在路线上走到哪了：段号 +
 float *routeCum = nullptr;        // v5.0 每个路线点离起点的路程（米），给路况颜色用
 uint8_t *routeCurv = nullptr;     // v6.1 每个路线点的弯急程度：0 直/缓，1 中弯，2 急弯
 // v5.0 路况：缓行/拥堵的路段（离起点的米数），"#u,起,止,状态,..."；状态 2 缓行 3 拥堵 4 严重拥堵
-#define TRAF_MAX 40
 int trafN = 0;
 int32_t trafA[TRAF_MAX], trafB[TRAF_MAX];
 uint8_t trafS[TRAF_MAX];
@@ -831,6 +829,7 @@ unsigned long routeSearchAt = 0;  // v3.0 上次全路线搜索的时间
 
 // ---- 当前位置 ----
 bool mapOn = true;
+bool forceArrow = false;           // v7.13.6 "#m,2"：强制大箭头页（地图数据照收，只切显示）
 int posFrame = -1;
 float posX = 0, posY = 0, posHdg = 0, posKmh = 0;
 unsigned long posAt = 0;
@@ -926,7 +925,6 @@ void parseMap(const uint8_t *p, uint32_t len) {
 }
 
 // v2.5 解析图片地图：u16 坐标系, i32 左上角 x, i32 左上角 y, u16 宽, u16 高, u16 每像素毫米, 然后是压缩的颜色编号
-uint16_t blendF(uint16_t a, uint16_t b, uint32_t t);
 bool rasHasPal = false;                    // v6.1 卫星图自带调色板
 uint16_t rasPal[16];
 
@@ -1864,6 +1862,7 @@ void handleBulk(const uint8_t *d, int n) {
 
 // 现在是否显示小地图
 bool mapModeActive() {
+  if (forceArrow) return false;                     // v7.13.6 App 手动切到大箭头：底图照收，只是不画
   if (!mapOn || !inNav) return false;
   bool vecOK = mapValid && mapFrame == posFrame;
   bool rasOK = rasterValid && rasterFrame == posFrame;      // v2.5
@@ -6063,6 +6062,8 @@ void drawNavHints(int bannerY) {
     drawBanner("REROUTING" + dots, bannerY, C_ORANGE);
   } else if (fasterAt) {
     drawBanner("FASTER ROUTE  -" + String(fasterMin) + "min", bannerY, C_GREEN);
+  } else if (trafficAlertOn()) {                                  // v7.13.5 前方拥堵：把距离一起写出来
+    drawBanner("JAM " + distText(trafficAlertDist), bannerY, C_RED);
   }
   if (gpsWeak) {                                                  // 左上角：橙色 “GPS” 加一条斜杠
     const int gx = CX - 136, gy = 150;
@@ -6114,14 +6115,29 @@ static inline float ringAngle(float dx, float dy) {
   return t < 0 ? t + 1 : t;
 }
 
-// 初版路况提醒环：先用独立外圈验证手机到屏幕的状态链路。
-void drawTrafficAlertRing() {
-  if (trafficAlertLevel < 3 || !inNav || millis() - trafficAlertAt > 90000UL) return;
+// v7.13.5 前方拥堵提醒环：同心外圈，只占 226~232 这 6 像素（原来圆心写的是 MAP_PY=262，
+// 半径 232 又约等于屏幕半径 233，下半圈整个掉到圆屏外，只剩顶部一道弧）。
+// 亮度做脉冲，带宽固定，不再随脉冲变粗变细。
+// nearOnly：地图页外圈和 JAM banner 只在 1.5km 内提示；大箭头页没有地图和路线，
+// 外圈是唯一的提示，多远都亮（传 false）。
+#define TRAFFIC_RING_IN   226
+#define TRAFFIC_RING_OUT  232
+#define TRAFFIC_FAR_M     1500UL     // 前方超过这个距离就不提示：太远的拥堵对骑手没有意义
+#define TRAFFIC_HOLD_MS   90000UL    // 手机不再发 #TR 之后最多再显示 90 秒
+
+bool trafficAlertOn(bool nearOnly) {
+  if (!inNav || trafficAlertLevel < 3) return false;
+  if (millis() - trafficAlertAt > TRAFFIC_HOLD_MS) return false;
+  if (nearOnly && trafficAlertDist > (int)TRAFFIC_FAR_M) return false;
+  return true;
+}
+
+void drawTrafficAlertRing(bool nearOnly) {
+  if (!trafficAlertOn(nearOnly)) return;
   float phase = (millis() % 1400) / 1400.0f;
   float pulse = 0.35f + 0.65f * (0.5f + 0.5f * sinf(phase * 2.0f * PI));
   uint16_t col = blendF(C_RED, C_BLACK, (uint32_t)((1.0f - pulse) * 120.0f));
-  int width = 3 + (int)(pulse * 7.0f);
-  for (int i = 0; i < width; ++i) gfx->drawCircle(CX, MAP_PY, 232 - i, col);
+  for (int r = TRAFFIC_RING_IN; r <= TRAFFIC_RING_OUT; r++) gfx->drawCircle(CX, CX, r, col);
 }
 
 // 外圈参数
@@ -6556,7 +6572,7 @@ void drawMapFrame() {
     // v7.4 平时外圈是行程环；出现转弯倒计时就换成倒计时环（盖掉行程环）
     float tp = ringActive ? -1 : tripFrac();
     drawRingLayer(navDir != "S" && tp < 0, ringActive ? ringShown : 0, isNear ? 14 : 10, isNear ? C_ORANGE : C_YELLOW, over, tp);
-    drawTrafficAlertRing();
+    drawTrafficAlertRing(true);                         // v7.13.5 地图页：1.5km 内才提示
   }
   profMark(6);
   drawMapSpeed(over);
@@ -6653,6 +6669,7 @@ void drawNavFrame() {
     drawRingProgress(ringShown, isNear ? 14 : 10, isNear ? C_ORANGE : C_YELLOW);
   }
   if (over) fillRingBand(0, 1, 228, 233, C_RED);
+  drawTrafficAlertRing(false);                          // v7.13.5 大箭头页没有地图和路线：外圈是唯一提示，不受 1.5km 限制
 
   drawStatus();
   drawSpeedBlock(over);

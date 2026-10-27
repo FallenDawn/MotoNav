@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MotoNav 拥堵显示 · 效果模拟</title>
+<style>
+  :root{
+    --bg:#0d0e10; --card:#17181b; --line:#2a2c31; --txt:#e8e9ea; --dim:#9a9da2; --dim2:#6d7076;
+    --amber:#EF9F27; --red:#E24B4A; --teal:#1D9E75;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:400 14px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{padding:34px 30px 10px;max-width:1280px;margin:0 auto}
+  h1{font-size:20px;font-weight:500;margin:0 0 8px}
+  .sub{color:var(--dim);font-size:13px;max-width:840px}
+  .sub code{background:#1e2024;padding:1px 5px;border-radius:4px;font-size:12px;color:#c9ccd1}
+  .legend{display:flex;gap:20px;flex-wrap:wrap;margin:18px 0 6px;font-size:12.5px;color:var(--dim)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .sw{width:22px;height:6px;border-radius:3px;display:inline-block}
+  .grid{max-width:1280px;margin:0 auto;padding:20px 30px 60px;
+        display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:22px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 14px 16px;
+        display:flex;flex-direction:column}
+  .frames{display:flex;gap:10px}
+  .frames.single{justify-content:center}
+  .fw{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;gap:6px}
+  .fw canvas{width:100%;height:auto;display:block}
+  .flabel{font-size:11.5px;color:var(--dim2)}
+  .tag{display:inline-block;font-size:11px;letter-spacing:.02em;padding:2px 8px;border-radius:20px;
+       border:1px solid var(--line);color:var(--dim);margin-bottom:9px;align-self:flex-start}
+  .tag.ok{color:#7fd6a9;border-color:#22503c;background:#12241c}
+  .tag.warn{color:#f0a3a2;border-color:#5a2b2b;background:#251415}
+  .tag.fix{color:#8fc0ee;border-color:#26415c;background:#111d29}
+  .card h3{font-size:14px;font-weight:500;margin:0 0 6px}
+  .card p{font-size:12.5px;color:var(--dim);margin:0;line-height:1.62}
+  .card p code{color:#c9ccd1;font-size:11.5px}
+  .grid.solo{grid-template-columns:1fr;max-width:560px}
+  .grid.solo .card{padding:20px}
+  .grid.solo canvas{max-width:520px;margin:0 auto}
+  footer{max-width:1280px;margin:0 auto;padding:0 30px 70px;color:var(--dim2);font-size:12px;line-height:1.9}
+  footer b{color:var(--dim);font-weight:500}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MotoNav 拥堵显示 · 效果模拟</h1>
+  <p class="sub">按 <code>NavMap.cpp</code> 里的绘制逻辑 1:1 移植：466×466 逻辑画布（缩放到 360×360 圆屏）、
+  <code>sc=0.7</code>、路线描边 <code>w0=15.2 / w1=10.5</code>、<code>RING_R=222</code>、
+  <code>CX=233 / MAP_PY=262</code>，颜色直接取固件里的 RGB565 值。
+  标「修复后」的帧是 v7.13.5 改完的样子（圆心同心 226~232、地图页和 banner 走 1.5km 门槛、
+  大箭头页外圈不受距离限制、banner 带距离）。</p>
+  <div class="legend">
+    <span><i class="sw" style="background:#FDA0"></i>缓行 2 · 0xFDA0</span>
+    <span><i class="sw" style="background:#E8E4"></i>拥堵 3 · 0xE8E4</span>
+    <span><i class="sw" style="background:#9000"></i>严重 4 · 0x9000</span>
+    <span><i class="sw" style="background:#F258"></i>路线 · 0xF258</span>
+    <span><i class="sw" style="background:#26E8"></i>行程环未走 · 0x26E8</span>
+    <span><i class="sw" style="background:#5AEB"></i>行程环走过 · 0x5AEB</span>
+  </div>
+</header>
+
+<section class="grid" id="gallery"></section>
+
+<footer>
+  <b>已核对的行号（boards/185b/MotoNav，v7.13.5 改动后）：</b>#u 解析 MotoNav.cpp:2953 · #TR 解析 MotoNav.cpp:2964 ·
+  状态变量 NavMap.cpp:821-823 / 53-54 · routeCum 构建 1543 · routeUAt 6025 · drawTraffic 6036 ·
+  drawNavHints 的 JAM banner 6064 · trafficAlertOn 6126 · drawTrafficAlertRing 6133 ·
+  地图页调用（门槛 on）6573 · 大箭头页调用（门槛 off）6670 ·
+  脉冲重绘节拍 MotoNav.cpp:3336 · 尺寸 pin_config.h:16-17。
+</footer>
+
+<script>
+(function(){
+  'use strict';
+
+  const W = 466, H = 466, CX = 233, MAP_PY = 262, RING_R = 222;
+  const SC = 0.7, WK = SC / 0.6;
+  const W0 = Math.max(6, 13 * WK);      // 路线外描边
+  const W1 = Math.max(4, 9 * WK);       // 路线内芯
+
+  const C_TRACK = 0x2945, C_TRIP_DONE = 0x5AEB, C_TRIP_LEFT = 0x26E8;
+  const C_RED = 0xF800, C_YELLOW = 0xF623, C_ORANGE = 0xFBC3;
+  const TRAF_SLOW = 0xFDA0, TRAF_JAM = 0xE8E4, TRAF_HEAVY = 0x9000;
+
+  const TH_DAY   = {block:0xE6D9, road:0x3187, park:0x760D, water:0x4E3B,
+                    route:0xF258, route2:0x78EC, done:0xA4B4, done2:0x62CC};
+  const TH_NIGHT = {block:0x20C7, road:0x6271, park:0x1207, water:0x0A2B,
+                    route:0xF258, route2:0x5047, done:0x7370, done2:0x1063};
+
+  function rgb565(v){
+    const r = (v >> 11) & 31, g = (v >> 5) & 63, b = v & 31;
+    return 'rgb(' + Math.round(r*255/31) + ',' + Math.round(g*255/63) + ',' + Math.round(b*255/31) + ')';
+  }
+  function blend565(a, b, t){
+    t = t > 256 ? 256 : (t < 0 ? 0 : t);
+    const ar=(a>>11)&31, ag=(a>>5)&63, ab=a&31;
+    const br=(b>>11)&31, bg=(b>>5)&63, bb=b&31;
+    const r=(ar*(256-t)+br*t)>>8, g=(ag*(256-t)+bg*t)>>8, bl=(ab*(256-t)+bb*t)>>8;
+    return (r<<11)|(g<<5)|bl;
+  }
+
+  // ---------- 路线 ----------
+  function buildRoute(startY, segs, carMeters){
+    const pts = [];
+    let x = 0, y = startY, hd = 0;
+    pts.push({x:x, y:y});
+    for (let s = 0; s < segs.length; s++){
+      const len = segs[s][0], dh = segs[s][1];
+      const n = Math.max(2, Math.round(len / 5));
+      for (let i = 1; i <= n; i++){
+        const t = i / n, h = (hd + dh * t) * Math.PI / 180;
+        x += Math.sin(h) * len / n;
+        y += Math.cos(h) * len / n;
+        pts.push({x:x, y:y});
+      }
+      hd += dh;
+    }
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++){
+      const dx = pts[i].x - pts[i-1].x, dy = pts[i].y - pts[i-1].y;
+      cum.push(cum[i-1] + Math.hypot(dx, dy));
+    }
+    return {pts:pts, cum:cum, carU:uAt(cum, carMeters), carM:carMeters};
+  }
+  function uAt(cum, m){
+    const n = cum.length;
+    if (m <= 0) return 0;
+    if (m >= cum[n-1]) return n - 1;
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1){ const mid = (lo + hi) >> 1; if (cum[mid] <= m) lo = mid; else hi = mid; }
+    const seg = cum[hi] - cum[lo];
+    return lo + (seg > 0 ? (m - cum[lo]) / seg : 0);
+  }
+  function ptAt(pts, u){
+    const n = pts.length;
+    if (u <= 0) return pts[0];
+    if (u >= n - 1) return pts[n-1];
+    const i = Math.floor(u), f = u - i;
+    const p = pts[i], q = pts[i+1];
+    return {x:p.x + (q.x - p.x) * f, y:p.y + (q.y - p.y) * f};
+  }
+
+  const ROUTE_OLD = buildRoute(-200, [[150,0],[150,22],[200,-6],[240,30],[200,0]], 200);
+  const ROUTE_NEW = buildRoute(-520, [[220,0],[180,18],[240,-14],[220,26],[180,0]], 520);
+
+  // ---------- 图元 ----------
+  function proj(p){ return {x: CX + SC * p.x, y: MAP_PY - SC * p.y}; }
+
+  function strokeRange(ctx, R, u0, u1, width, color){
+    const n = R.pts.length;
+    u0 = Math.max(0, Math.min(n - 1, u0));
+    u1 = Math.max(0, Math.min(n - 1, u1));
+    if (u1 - u0 < 0.0005) return;
+    ctx.beginPath();
+    const s0 = proj(ptAt(R.pts, u0));
+    ctx.moveTo(s0.x, s0.y);
+    for (let i = Math.floor(u0) + 1; i < Math.ceil(u1); i++){
+      if (i <= 0 || i >= n) continue;
+      const s = proj(R.pts[i]);
+      ctx.lineTo(s.x, s.y);
+    }
+    const s1 = proj(ptAt(R.pts, u1));
+    ctx.lineTo(s1.x, s1.y);
+    ctx.lineWidth = width;
+    ctx.strokeStyle = color;
+    ctx.stroke();
+  }
+
+  function bandArc(ctx, r0, r1, a0, a1, color){
+    if (a1 - a0 <= 0.0001) return;
+    ctx.beginPath();
+    ctx.arc(CX, CX, (r0 + r1) / 2, -Math.PI/2 + a0, -Math.PI/2 + a1);
+    ctx.lineWidth = r1 - r0;
+    ctx.lineCap = 'butt';
+    ctx.strokeStyle = color;
+    ctx.stroke();
+  }
+
+  function drawStreets(ctx, th){
+    ctx.save();
+    ctx.globalAlpha = 0.9;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = rgb565(th.road);
+    const vs = [[58,11],[128,7],[196,13],[300,8],[392,12]];
+    for (let i = 0; i < vs.length; i++){
+      ctx.lineWidth = vs[i][1];
+      ctx.beginPath(); ctx.moveTo(vs[i][0], -30); ctx.lineTo(vs[i][0] + 46, H + 30); ctx.stroke();
+    }
+    const hs = [[54,10],[150,7],[236,12],[338,8],[420,10]];
+    for (let i = 0; i < hs.length; i++){
+      ctx.lineWidth = hs[i][1];
+      ctx.beginPath(); ctx.moveTo(-30, hs[i][0]); ctx.lineTo(W + 30, hs[i][0] - 28); ctx.stroke();
+    }
+    ctx.fillStyle = rgb565(th.park);
+    ctx.fillRect(24, 268, 96, 74);
+    ctx.fillStyle = rgb565(th.water);
+    ctx.beginPath(); ctx.ellipse(376, 96, 62, 40, -0.35, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawRouteLayer(ctx, R, o, th){
+    const split = (o.split == null) ? R.carU : o.split;
+    const trail = (o.trail == null) ? 1 : o.trail;
+    ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+
+    if (split > 0 && trail === 1){
+      strokeRange(ctx, R, 0, split, W0 * 0.8, rgb565(th.done2));
+      strokeRange(ctx, R, 0, split, W1 * 0.75, rgb565(th.done));
+    }
+    const last = R.pts.length - 1;
+    strokeRange(ctx, R, split, last, W0, rgb565(th.route2));
+    strokeRange(ctx, R, split, last, W1, rgb565(th.route));
+
+    const traf = o.traf || [];
+    for (let i = 0; i < traf.length; i++){
+      const a = Math.max(uAt(R.cum, traf[i].a), split);
+      const b = uAt(R.cum, traf[i].b);
+      if (b <= a) continue;
+      const s = traf[i].s;
+      const col = rgb565(s >= 4 ? TRAF_HEAVY : (s === 3 ? TRAF_JAM : TRAF_SLOW));
+      strokeRange(ctx, R, a, b, W0, rgb565(th.route2));
+      strokeRange(ctx, R, a, b, W1, col);
+    }
+  }
+
+  function drawPlayer(ctx){
+    const x = CX, y = MAP_PY;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 17);
+    ctx.lineTo(x + 12, y + 13);
+    ctx.lineTo(x, y + 6);
+    ctx.lineTo(x - 12, y + 13);
+    ctx.closePath();
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.lineWidth = 3.5;
+    ctx.fill(); ctx.stroke();
+  }
+
+  function drawVignette(ctx){
+    const g = ctx.createRadialGradient(CX, CX, 168, CX, CX, 212);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(CX, CX, 212, 0, Math.PI*2); ctx.fill();
+  }
+
+  function drawRings(ctx, o){
+    if (o.ring && o.ring.track) bandArc(ctx, 217, 227, 0, Math.PI*2, rgb565(C_TRACK));
+
+    if (o.trip != null){
+      bandArc(ctx, RING_R - 2, RING_R + 2, 0, Math.PI*2, rgb565(C_TRIP_LEFT));
+      if (o.trip > 0.002) bandArc(ctx, RING_R - 2, RING_R + 2, 0, o.trip * Math.PI*2, rgb565(C_TRIP_DONE));
+      if (o.trip > 0.002 && o.trip < 0.998){
+        const a = o.trip * Math.PI*2;
+        const px = CX + RING_R * Math.sin(a), py = CX - RING_R * Math.cos(a);
+        ctx.beginPath(); ctx.arc(px, py, 5, 0, Math.PI*2); ctx.fillStyle = '#000'; ctx.fill();
+        ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI*2); ctx.fillStyle = '#fff'; ctx.fill();
+      }
+    }
+
+    if (o.ring && o.ring.prog > 0){
+      const h = o.ring.thick / 2;
+      const col = rgb565(o.ring.col);
+      bandArc(ctx, RING_R - h, RING_R + h, 0, o.ring.prog * Math.PI*2, col);
+      ctx.fillStyle = col;
+      const a = o.ring.prog * Math.PI*2;
+      ctx.beginPath(); ctx.arc(CX, CX - RING_R, h, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(CX + RING_R * Math.sin(a), CX - RING_R * Math.cos(a), h, 0, Math.PI*2); ctx.fill();
+    }
+
+    if (o.over) bandArc(ctx, 228, 233, 0, Math.PI*2, rgb565(C_RED));
+  }
+
+  // 固件 drawTrafficAlertRing()：修复前圆心 (CX, MAP_PY)、半径 232 起、宽度随脉冲；
+  // 修复后同心 (CX, CX)、固定 226~232，只有亮度脉冲
+  function drawAlert(ctx, a){
+    const phase = (a.phase == null) ? 0.55 : a.phase;
+    const pulse = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(phase * Math.PI * 2));
+    const col = rgb565(blend565(C_RED, 0x0000, Math.round((1 - pulse) * 120)));
+    if (a.fixed){
+      for (let r = 226; r <= 232; r++){
+        ctx.beginPath(); ctx.arc(CX, CX, r, 0, Math.PI*2);
+        ctx.lineWidth = 1.15; ctx.strokeStyle = col; ctx.stroke();
+      }
+      return;
+    }
+    const width = (a.width != null) ? a.width : 3 + Math.floor(pulse * 7);
+    for (let i = 0; i < width; i++){
+      ctx.beginPath();
+      ctx.arc(CX, MAP_PY, 232 - i, 0, Math.PI*2);
+      ctx.lineWidth = 1.15;
+      ctx.strokeStyle = col;
+      ctx.stroke();
+    }
+  }
+
+  function drawBanner(ctx, text, y){
+    const w = text.length * 12 + 24;
+    ctx.fillStyle = 'rgba(0,0,0,0.68)';
+    ctx.fillRect(CX - w/2, y - 6, w, 30);
+    ctx.fillStyle = rgb565(C_ORANGE);
+    ctx.font = '500 20px system-ui,-apple-system,"Segoe UI",sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, CX, y + 9);
+    ctx.textAlign = 'start';
+    ctx.textBaseline = 'alphabetic';
+  }
+
+  // 大箭头页（关掉小地图后的画面）：只有外圈行程环，没有任何路况信息
+  function drawArrowPage(ctx, o){
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+    bandArc(ctx, RING_R - 2, RING_R + 2, 0, Math.PI*2, rgb565(C_TRIP_LEFT));
+    const tp = (o.trip == null) ? 0.42 : o.trip;
+    if (tp > 0.002) bandArc(ctx, RING_R - 2, RING_R + 2, 0, tp * Math.PI*2, rgb565(C_TRIP_DONE));
+    const x = CX, y0 = 300, y1 = 150;
+    ctx.lineCap = 'butt';
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 44;
+    ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y0 - 60); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y0 - 60); ctx.quadraticCurveTo(x, y1 + 20, x + 62, y1 + 20); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + 62 + 46, y1 + 20);
+    ctx.lineTo(x + 62 - 6, y1 + 20 - 40);
+    ctx.lineTo(x + 62 - 6, y1 + 20 + 40);
+    ctx.closePath(); ctx.fillStyle = '#fff'; ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = '500 64px system-ui,sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('300', CX, 372);
+    ctx.font = '400 22px system-ui,sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.fillText('m', CX, 400);
+    ctx.textAlign = 'start';
+  }
+
+  function drawFrame(cv, o){
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.clearRect(0, 0, W, H);
+
+    if (o.page === 'arrow'){
+      ctx.save();
+      ctx.beginPath(); ctx.arc(CX, CX, 233, 0, Math.PI*2); ctx.clip();
+      drawArrowPage(ctx, o);
+      if (o.alert) drawAlert(ctx, o.alert);
+      if (o.banner) drawBanner(ctx, o.banner, o.bannerY == null ? 128 : o.bannerY);
+      ctx.restore();
+    } else {
+      const th = o.night ? TH_NIGHT : TH_DAY;
+      const R = (o.route === 'new') ? ROUTE_NEW : ROUTE_OLD;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(CX, CX, 233, 0, Math.PI*2); ctx.clip();
+      ctx.fillStyle = rgb565(th.block);
+      ctx.fillRect(0, 0, W, H);
+      drawStreets(ctx, th);
+      drawRouteLayer(ctx, R, o, th);
+      drawPlayer(ctx);
+      drawVignette(ctx);
+      ctx.beginPath(); ctx.arc(CX, CX, 222, 0, Math.PI*2);
+      ctx.lineWidth = 22; ctx.strokeStyle = '#000'; ctx.stroke();
+      drawRings(ctx, o);
+      if (o.alert) drawAlert(ctx, o.alert);
+      if (o.banner) drawBanner(ctx, o.banner, o.bannerY == null ? 300 : o.bannerY);
+      ctx.restore();
+    }
+
+    // 圆屏遮罩
+    ctx.globalCompositeOperation = 'destination-in';
+    ctx.beginPath(); ctx.arc(CX, CX, 233, 0, Math.PI*2); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.beginPath(); ctx.arc(CX, CX, 232, 0, Math.PI*2);
+    ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.stroke();
+  }
+
+  const SCEN = [
+    { tag:'ok', title:'基准 · 没有路况数据', note:'<code>trafN=0</code> 时 <code>drawTraffic()</code> 第一行就 return（NavMap.cpp:6037），路线保持主题色。外圈 4px 行程环：绿=还没走，灰=走过。',
+      frames:[{opts:{traf:[], trip:0.42}}] },
+
+    { tag:'ok', title:'缓行（状态 2）', note:'<code>#u,220,520,2</code> → 0xFDA0。实际偏橙，比 <code>C_YELLOW(0xF623)</code> 淡一截，白天看着像"路肩色"。',
+      frames:[{opts:{traf:[{a:220,b:520,s:2}], trip:0.42}}] },
+
+    { tag:'ok', title:'拥堵（状态 3）', note:'<code>#u,240,600,3</code> → 0xE8E4。和粉紫路线色对比够，但和超速红圈、断线红圈是同一色系，环上一亮容易混。',
+      frames:[{opts:{traf:[{a:240,b:600,s:3}], trip:0.42}}] },
+
+    { tag:'ok', title:'严重拥堵（状态 4）', note:'<code>&gt;=4</code> 全走 0x9000 深红。在深色主题（GTA5 / 雷达 / 夜间）上会糊进背景，辨识度最差的一档。',
+      frames:[{opts:{traf:[{a:260,b:640,s:4}], trip:0.42}}] },
+
+    { tag:'ok', title:'三段混合', note:'一条 <code>#u</code> 里连续 3 段，段间不做渐变。上限 40 段，但 511 字节文本上限会先卡住（每段约 13 字符 → 实际约 36 段）。',
+      frames:[{opts:{traf:[{a:150,b:300,s:2},{a:330,b:560,s:3},{a:580,b:760,s:4}], trip:0.42}}] },
+
+    { tag:'ok', title:'走过的部分不上色', note:'<code>drawTraffic()</code> 里 <code>a = max(routeUAt(起), from)</code>，<code>from</code> 是车在路线上的位置。身后那段红完全看不到——"刚堵过去"没有任何反馈。',
+      frames:[{opts:{traf:[{a:80,b:320,s:3}], trip:0.42}}] },
+
+    { tag:'warn', title:'提醒环：圆心改回屏幕中心', note:'原来 <code>drawCircle(CX, MAP_PY, 232-i)</code> 的圆心是车头 <code>MAP_PY=262</code>，而圆屏中心是 (233,233)，半径 232 又约等于屏幕半径 233 → 下半圈整个掉到屏外。现在同心、固定占 226~232，只有亮度脉冲，带宽不再随脉冲变粗变细。',
+      frames:[{label:'修复前', opts:{traf:[], trip:0.42, alert:{phase:0.5}}},
+              {label:'修复后', opts:{traf:[], trip:0.42, alert:{phase:0.5, fixed:true}}}] },
+
+    { tag:'warn', title:'提醒环 × 转弯倒计时环', note:'修复前两个圆心差 29px，弧线在左右两侧交叉；同心之后不再交叉，但倒计时环加粗到 14px 时外沿到 229，仍会被提醒环压住 3px。',
+      frames:[{label:'修复前', opts:{traf:[{a:200,b:420,s:3}], trip:null,
+                    ring:{prog:0.62, thick:14, track:true, col:C_ORANGE},
+                    alert:{phase:0.72}}},
+              {label:'修复后', opts:{traf:[{a:200,b:420,s:3}], trip:null,
+                    ring:{prog:0.62, thick:14, track:true, col:C_ORANGE},
+                    alert:{phase:0.72, fixed:true}}}] },
+
+    { tag:'warn', title:'重规划后路况错位', note:'<code>#u</code> 的米数是"离路线起点"，重规划后起点变了，<code>parseRoute()</code> 又不清 <code>trafN</code>。同一组数字直接套到新路线上。',
+      frames:[{label:'重规划前', opts:{traf:[{a:240,b:600,s:3}], trip:0.42, route:'old'}},
+              {label:'重规划后（#u 还没重发）', opts:{traf:[{a:240,b:600,s:3}], trip:0.42, route:'new'}}] },
+
+    { tag:'warn', title:'夜间配色不降亮度', note:'路况色是硬编码 0xFDA0/0xE8E4/0x9000，不跟 <code>#n,1</code> 变暗。夜里路线已经压暗，这三段反而比路线本身还亮，很扎眼。',
+      frames:[{opts:{traf:[{a:220,b:520,s:2},{a:540,b:700,s:3}], trip:0.42, night:true}}] },
+
+    { tag:'fix', title:'大箭头页：外圈不受 1.5km 限制', note:'大箭头页没有地图和路线，外圈是唯一的拥堵提示，所以多远都亮（<code>drawTrafficAlertRing(false)</code>）。但 JAM banner 仍然只在 1.5km 内弹——图上是前方 2.4km，只有环、没有字。',
+      frames:[{label:'修复前', opts:{page:'arrow'}},
+              {label:'修复后 · 前方 2.4km', opts:{page:'arrow', alert:{phase:0.5, fixed:true}}}] },
+
+    { tag:'fix', title:'地图页：1.5km 距离门槛', note:'地图页外圈和 JAM banner 走 <code>trafficAlertOn(true)</code>：<code>trafficAlertDist &gt; 1500</code> 就不亮环、不弹 banner。路线染色照旧，完全不受门槛影响。',
+      frames:[{label:'前方 2.0km：不提示', opts:{traf:[{a:1900,b:2200,s:3}], trip:0.42}},
+              {label:'前方 300m：红环 + banner', opts:{traf:[{a:200,b:520,s:3}], trip:0.42,
+                    alert:{phase:0.5, fixed:true}, banner:'JAM 300m'}}] },
+
+    { tag:'fix', title:'大箭头页 · 进了 1.5km 才有字', note:'同一个大箭头页，距离进到 1.5km 以内才弹出 <code>JAM 300m</code>；banner 位置 128（小地图是 300），会压在图标上沿。',
+      frames:[{label:'前方 300m：环 + banner', opts:{page:'arrow', alert:{phase:0.5, fixed:true},
+                    banner:'JAM 300m', bannerY:128}}] }
+  ];
+
+  function buildGallery(){
+    const host = document.getElementById('gallery');
+    let list = SCEN;
+    const q = (typeof location !== 'undefined') ? location.search.match(/[?&]only=(\d+)/) : null;
+    if (q){
+      list = [SCEN[parseInt(q[1], 10)]];
+      host.className = 'grid solo';
+    }
+    for (let i = 0; i < list.length; i++){
+      const s = list[i];
+      const card = document.createElement('article');
+      card.className = 'card';
+
+      const tag = document.createElement('span');
+      tag.className = 'tag ' + s.tag;
+      tag.textContent = s.tag === 'warn' ? '现状问题' : (s.tag === 'fix' ? '建议' : '正常行为');
+      card.appendChild(tag);
+
+      const frames = document.createElement('div');
+      frames.className = 'frames' + (s.frames.length === 1 ? ' single' : '');
+
+      for (let f = 0; f < s.frames.length; f++){
+        const fr = s.frames[f];
+        const wrap = document.createElement('div');
+        wrap.className = 'fw';
+        const cv = document.createElement('canvas');
+        cv.width = W; cv.height = H;
+        wrap.appendChild(cv);
+        if (fr.label){
+          const lb = document.createElement('div');
+          lb.className = 'flabel';
+          lb.textContent = fr.label;
+          wrap.appendChild(lb);
+        }
+        frames.appendChild(wrap);
+        drawFrame(cv, fr.opts);
+      }
+      card.appendChild(frames);
+
+      const h3 = document.createElement('h3');
+      h3.textContent = s.title;
+      card.appendChild(h3);
+
+      const p = document.createElement('p');
+      p.innerHTML = s.note;
+      card.appendChild(p);
+
+      host.appendChild(card);
+    }
+  }
+
+
+  if (typeof document !== 'undefined') buildGallery();
+  if (typeof module !== 'undefined' && module.exports){
+    module.exports = {drawFrame:drawFrame, SCEN:SCEN, W:W, H:H};
+  }
+})();
+</script>
+</body>
+</html>

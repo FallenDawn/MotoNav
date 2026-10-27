@@ -203,6 +203,7 @@
 //   'B' + 二进制头 + 数据   文字图片（4 位灰度），见 handleBitmap()
 //   #p,坐标系,x分米,y分米,朝向,车速   v2.0 当前位置（平面坐标，x 向东 y 向北）
 //   #m,1 / #m,0           v2.0 小地图开 / 关
+//   #m,2                  v7.13.6 强制大箭头页（底图照常收，只切显示；旧固件会当成 #m,1）
 //   #q,40 / #q,60 / #q,80 v2.3 屏幕数据线速度（MHz），保存后重启生效
 //   #f,1 / #f,0           v2.6 快速刷屏 开 / 关，保存后重启生效
 //   #t,0 / #t,1 / #t,2    v2.9 地图配色：0 原版，1 罪恶都市，2 GTA5（v6.1 增加 3~10，见版本记录）
@@ -223,6 +224,8 @@
 //   #w,1 / #w,0           v4.9 清爽模式开 / 关
 //   #i,1,号码 / #i,0      v5.1 来电显示开始 / 结束（名字用 'B' 图片栏 2）
 //   #u,起,止,状态,...      v5.0 路况（米，离路线起点）；#y,1/0 重新规划中；#h,分钟 / #h 更快路线；#x,1/0 GPS 弱
+//   #TR,等级,前方米,覆盖米  v5.0 前方拥堵提醒：等级 3 拥堵 / 4 严重拥堵时外圈亮红环并显示 JAM 距离；
+//                         v7.13.5 前方超过 1.5km 不提示，90 秒没收到新的 #TR 自动消失
 //   #HM,0/1               v7.9 App 音乐控制 / HID 媒体按键（保存到圆屏；互斥）
 //   HID,模式,可发按键        v7.9 HID 就绪状态；CAP,HID,1 能力通知
 //   #Z,有会话,播放中,按钮掩码   v7.8 音乐状态（1=上一首，2=播放暂停，4=下一首）；图片栏 5/6 为歌名/歌手
@@ -232,17 +235,13 @@
 //   U,1                   v6.5 这台手机通过了配对验证（连上后发 3 次）
 //   V,电量,充电,USB,mV    v6.8 圆屏电池（电量 -1 = 没接电池）
 
-#define FW_VERSION "v7.13.1-185B"
+#define FW_VERSION "v7.14.6-185B"
 
 // 调试时想在串口监视器里看到每条收到的文字指令，把 0 改成 1
 #define DEBUG_SERIAL 0
 
 // 导航中超过这么久没收到任何消息（含心跳），就提示数据中断
 #define STALE_MS 6000
-
-// 三阶段的分界距离（米），可按需要调整
-#define STAGE_FAR_M  500   // 超过这个距离：远处预告画面
-#define STAGE_NEAR_M 100   // 小于等于这个距离：橙色警示
 
 #include <Arduino.h>
 #include "Arduino_GFX_Library.h"
@@ -255,7 +254,6 @@
 #include "PortScale.h"
 #include "Board185BPanel.h"     // v5.2 触摸屏（SensorLib 库，微雪示例里带的）
 #include "HomeAnimation.h"
-void drawBackground();
 #include <Preferences.h>
 #include <SPIFFS.h>
 #include <esp_sleep.h>
@@ -273,12 +271,10 @@ void drawBackground();
 #include "AppleMediaClient.h"
 #include "ScreenRotationCommand.h"
 #include <BLESecurity.h>       // v6.5 配对验证
-#include <miniz.h>            // 罪恶都市轮廓：仅接收地图时解压
 #include "BootAnimation.h"
 #include "BootAudioData.h"
 #include <es8311.h>
 #include <driver/i2s.h>
-#include "DragonRadar.h"
 int bootBrand = 0;
 String pendingBootAck;
 #include <esp_mac.h>           // v7.0 读蓝牙地址，拼蓝牙名
@@ -302,11 +298,8 @@ size_t bootAudioOffset = 78; // 44-byte RIFF header plus the WAV metadata chunk
 uint32_t bootAudioDueAt = 0;
 TaskHandle_t bootAudioTaskHandle = nullptr;
 struct TextImg;    // Arduino 自动生成的函数声明需要先认识文字图片类型。
-void flushLogicalFrame(const uint16_t *fb);
-void drawLanesAt(float centerX, float y0, float maxW, float h);
 void drawPageDots();
 void weatherTap();
-void drawCompassBlip(float px, float py, bool outside);
 bool backlightPWM=false;
 
 void stopBootAudio() {
@@ -401,38 +394,6 @@ bool frameIsMap = false;          // v2.2 这一帧是小地图（整帧重画�
 int qspiMHz = 40;                 // v2.3 屏幕数据线速度
 bool fastFlushOn = true;          // v2.6 快速刷屏
 
-
-// ===== 颜色（RGB565）=====
-#define C_BLACK  0x0000
-#define C_WHITE  0xFFFF
-#define C_GREEN  0x07E0
-#define C_GREY   0x7BEF
-#define C_CYAN   0x07FF
-#define C_RED    0xF800
-#define C_DIM    0x6B4D   // #6B6B6B 预告、非推荐车道用的灰色
-#define C_TRACK  0x2945   // #2A2A2A 进度环底色
-#define C_YELLOW 0xF623   // #F5C518
-#define C_ORANGE 0xFBC3   // #FF7A1A
-#define C_SEP    0x31A6   // #333333 车道分隔线
-#define C_SIGNRED 0xE104  // #E02020 限速牌红圈
-
-// ===== 屏幕几何：466x466，圆心 (233, 233) =====
-#define CX 233
-#define RING_R 222
-
-// ===== 布局（y 坐标）=====
-#define SPEED_Y      50    // 车速数字顶部
-#define ICON_CY      188   // 没有车道时，图标中心（v1.8.2 起只作初始位置，最终按可用区域自动摆放）
-#define ICON_CY_LANE 172   // 有车道时，图标中心
-#define ICON_TOP     120   // v1.8.2 图标可用区域上沿（车速 km/h 下方）
-#define ICON_MAX_W   250   // 图标最大宽度
-#define LANES_Y      238   // 车道行顶部
-#define DIST_Y       250   // 没有车道时，距离数字顶部（8 号字）
-#define DIST_Y_LANE  258   // 有车道时，距离数字顶部（7 号字）
-#define ROAD_Y       334   // 没有车道时，路名图片顶部
-#define ROAD_Y_LANE  334   // 有车道时，路名图片顶部
-#define BOTTOM_Y     372   // 底部信息图片顶部（常驻显示）
-#define TEXT_R       200   // 文字必须在这个半径以内（圆环内沿约 215）
 
 // ===== 蓝牙：手机端必须用同样的名字和 UUID =====
 #define DEVICE_NAME  "MotoNav"
@@ -934,8 +895,6 @@ int16_t rnd(float v) { return (int16_t)lroundf(v); }
 Prim prims[PRIM_MAX];
 int primN = 0;
 bool recIcon = false;      // true = 正在记录图标，thickLine/arrowHead/iconCircle 只记录不直接画
-#define ICON_BUF_W 360
-#define ICON_BUF_H 360
 uint16_t *iconBuf = nullptr;
 int iconX = 0, iconY = 0, iconW = 0, iconH = 0;
 uint32_t iconHash = 0;
@@ -1349,7 +1308,7 @@ void handleBitmap(const uint8_t *d, int n) {
 // 没连上时摩托车灯熄灭、她闭眼打瞌睡，头上飘 z
 // v4.6 首页像素骑手（原创角色）：40×26，每格放大 RIDER_S 倍；由 rider2.py 生成
 // 帧：stand0、stand1、blink0、blink1、wave0、wave1、sleep
-// 页面槽位：负一屏音乐，第一屏主页/导航，第二屏 IMU，第三屏天气（枚举在 MotoNavCommon.h）。
+// 页面从左到右：音乐、胎压、主页/导航、IMU、天气（枚举在 MotoNavCommon.h）。
 int page = PAGE_HOME;
 unsigned long pageAt = 0;
 
@@ -1364,8 +1323,46 @@ float imuGyroBiasX=0, imuGyroBiasY=0, imuGyroBiasZ=0;
 uint32_t imuLastMs=0;
 uint32_t imuBootMs=0, imuStillSince=0;
 uint16_t imuCalSamples=0;
-float imuCalX=0, imuCalY=0, imuCalZ=0;
 bool imuFilterStarted=false;
+
+// ---- v7.14.0 G 值算法 ----
+// imuLatG / imuLonG：按 dt 归一、在 imuTick 里算好的侧向 / 纵向 G（已平滑），绘制层只读。
+// imuLeanSign：倾角符号（带 3° 滞环）。加速度计只能给出 |φ|，符号必须靠陀螺积分。
+#define G_LEAN_SIGN 1.0f            // 上车后若倾角 / 侧向 G 方向相反，改成 -1.0f
+// v7.14.3 调试用：G 页底部打两行车身坐标 / 倾角小字，确认安装方向对不对。
+//   加速前进 → F 应为正；刹车 → F 为负；平放 → U≈1.00。
+//   v7.14.6 起默认关闭（页面保持干净），要排查时改回 1。
+#define IMU_SHOW_AXES 0
+float imuLatG=0, imuLonG=0;
+float imuLeanSign=1.0f;
+// v7.14.1 静止检测（ZUPT）：用陀螺 0.5s 窗口的均值/方差判断"稳不稳"，不看绝对值。
+// 零偏本身可能有好几 dps，用 |gyro|<2dps 这种绝对门限会把静止误判成运动，
+// 结果零偏永远学不到、roll 一路积分漂走 —— 这就是"放着不动 lean 一直涨"的原因。
+float imuGyroAvgX=0, imuGyroAvgY=0, imuGyroAvgZ=0;
+float imuGyroVarX=0, imuGyroVarY=0, imuGyroVarZ=0;
+bool  imuStill=false;
+
+// ---- v7.14.3 车身坐标映射（这一版修的就是它）----
+// 185B 的实际安装：屏幕朝上、屏幕顶边朝车头（G 页的 FRONT 就画在顶上，用户就是这么读的）。
+// QMI8658 的轴跟屏幕对齐，于是：
+//     IMU X = 车身右 (right)   IMU Y = 车身前 (forward)   IMU Z = 车身上 (up)
+// 旧代码按 "X=前、Y=侧、Z=上" 写的（ar=atan2(ay,az)、lonNow 用 ax），跟实际差了 90°：
+// 纵向加速度整个落进 ay，被 sqrt(|f|²-1-lon²) 当成横向；而且开了平方永远为正、符号又是
+// 开机时锁死的 +1 —— 所以球只会往 RIGHT 走，前进后退都一样。
+// 现在把"IMU 的哪个轴是车身右/前/上"显式写出来，换安装方向只改下面这一行：
+//     屏幕顶边朝前：{ 0,1,2, +1,+1,+1 }      屏幕顶边朝后：{ 0,1,2, -1,-1,+1 }
+//     屏幕顶边朝右：{ 1,0,2, +1,-1,+1 }      屏幕顶边朝左：{ 1,0,2, -1,+1,+1 }
+// 若球上下跑反了，翻 fwd 的符号；左右跑反了，翻 right 的符号。
+struct ImuMount { uint8_t right, fwd, up; float sr, sf, su; };
+static const ImuMount IMU_MOUNT = { 0, 1, 2, +1.0f, +1.0f, +1.0f };   // R=X+  F=Y+  U=Z+
+static inline void imuToBody(const float *raw, float &r, float &f, float &u) {
+  r = raw[IMU_MOUNT.right] * IMU_MOUNT.sr;
+  f = raw[IMU_MOUNT.fwd]   * IMU_MOUNT.sf;
+  u = raw[IMU_MOUNT.up]    * IMU_MOUNT.su;
+}
+// 车身坐标下的比力分量（g）。给屏幕上的调轴小字用，确认安装方向对不对。
+float imuBodyR=0, imuBodyF=0, imuBodyU=1;
+float imuRollRel=0, imuLatBDbg=0;   // 调试用：相对倾角、tan(相对倾角)
 
 static float imuWrap180(float deg) {
   while (deg > 180.0f) deg -= 360.0f;
@@ -1392,10 +1389,14 @@ void imuResetReference() {
 
 void imuTick(){
   if(!imuOK) return;
+  const uint32_t now = millis();
+  // v7.14.0 采样节流到 8ms（≈125Hz，QMI8658 的 ODR 是 112Hz）。主循环是 kHz 级，
+  // 不节流会反复读到同一个样本，所有"每次调用"给的滤波系数都会失真：原来加速度权重 0.04
+  // 相当于每毫秒修正一次，等效时间常数只有 25ms，压弯时 roll 被瞬间拉回 0。
+  if (imuLastMs && (now - imuLastMs) < 8) return;
   AccelerometerData a; GyroscopeData g;
   if(!imu.readAccel(a) || !imu.readGyro(g)) return;
-  const uint32_t now = millis();
-  const float dt = imuLastMs ? constrain((now - imuLastMs) * 0.001f, 0.001f, 0.05f) : 0.01f;
+  const float dt = imuLastMs ? constrain((now - imuLastMs) * 0.001f, 0.008f, 0.05f) : 0.01f;
   imuLastMs = now;
   if (!imuBootMs) imuBootMs = now;
 
@@ -1403,96 +1404,219 @@ void imuTick(){
   imuAy=a.mps2.y/9.80665f;
   imuAz=a.mps2.z/9.80665f;
   imuG=sqrtf(imuAx*imuAx+imuAy*imuAy+imuAz*imuAz);
-  const float ar=atan2f(imuAy,imuAz)*57.2957795f;
-  const float ap=atan2f(-imuAx,sqrtf(imuAy*imuAy+imuAz*imuAz))*57.2957795f;
-  const bool stationaryRaw = fabsf(imuG - 1.0f) < 0.15f &&
-                             fabsf(g.dps.x) < 3.0f && fabsf(g.dps.y) < 3.0f &&
-                             fabsf(g.dps.z) < 3.0f;
-  imuLinearG = stationaryRaw ? 0.0f : fabsf(imuG - 1.0f);
+  // v7.14.3 先把原始三轴换成车身坐标，后面所有姿态和 G 都用车身轴算。
+  const float rawA[3] = { imuAx, imuAy, imuAz };
+  float aR, aF, aU;
+  imuToBody(rawA, aR, aF, aU);
+  imuBodyR = aR; imuBodyF = aF; imuBodyU = aU;
+  // 横滚：向右压为正。右压时车身上轴倒向右侧，比力的"右"分量变成负的（躺右侧 90° 读 -1g），
+  // 所以取 -aR。抬头为正的俯仰用 aF。
+  const float ar=atan2f(-aR,aU)*57.2957795f;
+  const float ap=atan2f(aF,sqrtf(aR*aR+aU*aU))*57.2957795f;
+  // ---- v7.14.1 静止检测（ZUPT）----
+  // 只看陀螺"稳不稳"：0.5s 窗口的均值与方差。方差小 + 合力≈1g → 静止。
+  // 老代码用 |gyro|<2dps 的绝对门限，零偏一旦超过 2dps 就永远判不成静止，
+  // 零偏学不到 → roll 纯积分 → 放着不动 LEAN 也一路涨。
+  {
+    const float ka = dt / (0.5f + dt);
+    float d;
+    d = g.dps.x - imuGyroAvgX; imuGyroAvgX += d * ka; imuGyroVarX += (d * d - imuGyroVarX) * ka;
+    d = g.dps.y - imuGyroAvgY; imuGyroAvgY += d * ka; imuGyroVarY += (d * d - imuGyroVarY) * ka;
+    d = g.dps.z - imuGyroAvgZ; imuGyroAvgZ += d * ka; imuGyroVarZ += (d * d - imuGyroVarZ) * ka;
+  }
+  // 方差 0.36 → 标准差 0.6dps。开机前 0.8s 窗口还没填满，不判静止。
+  imuStill = (now - imuBootMs > 800) && fabsf(imuG - 1.0f) < 0.04f &&
+             imuGyroVarX < 0.36f && imuGyroVarY < 0.36f && imuGyroVarZ < 0.36f;
 
-  // 开机前 3 秒只在确认静止时采集 gyro 零偏，避免把手拿起时的动作写进校准值。
-  if (now - imuBootMs < 3000 && stationaryRaw) {
-    imuCalX += g.dps.x; imuCalY += g.dps.y; imuCalZ += g.dps.z;
+  // 水平加速度 = sqrt(|f|²-1)。旧写法 |f|-1 在 45° 压弯时给 0.414g，真值 1.0g，差 59%。
+  const float horizG = imuG > 1.0f ? sqrtf(imuG * imuG - 1.0f) : 0.0f;
+  imuLinearG = imuStill ? 0.0f : horizG;
+
+  // 零偏：静止时直接跟窗口均值走。前 200 个静止样本用 0.25s 快速收敛，之后 3s 慢跟温漂。
+  if (imuStill) {
+    const float kb = imuCalSamples < 200 ? dt / (0.25f + dt) : dt / (3.0f + dt);
+    imuGyroBiasX += (imuGyroAvgX - imuGyroBiasX) * kb;
+    imuGyroBiasY += (imuGyroAvgY - imuGyroBiasY) * kb;
+    imuGyroBiasZ += (imuGyroAvgZ - imuGyroBiasZ) * kb;
     if (imuCalSamples < 60000) imuCalSamples++;
-    if (imuCalSamples >= 8) {
-      imuGyroBiasX = imuCalX / imuCalSamples;
-      imuGyroBiasY = imuCalY / imuCalSamples;
-      imuGyroBiasZ = imuCalZ / imuCalSamples;
-    }
   }
 
   if (!imuFilterStarted) {
     imuRoll = ar;
     imuPitch = ap;
     imuYaw = 0;
+    imuLatG = 0; imuLonG = 0;
+    imuLeanSign = (ar >= 0.0f) ? 1.0f : -1.0f;
     imuFilterStarted = true;
   }
 
-  float wx = g.dps.x - imuGyroBiasX;
-  float wy = g.dps.y - imuGyroBiasY;
-  float wz = g.dps.z - imuGyroBiasZ;
-  if (stationaryRaw) {
-    if (!imuStillSince) imuStillSince = now;
-    // 静止超过 0.5 s 后慢速跟踪温漂，避免 yaw 在桌面上继续累积。
-    if (now - imuStillSince > 500) {
-      imuGyroBiasX += (g.dps.x - imuGyroBiasX) * 0.002f;
-      imuGyroBiasY += (g.dps.y - imuGyroBiasY) * 0.002f;
-      imuGyroBiasZ += (g.dps.z - imuGyroBiasZ) * 0.002f;
-      wx = g.dps.x - imuGyroBiasX;
-      wy = g.dps.y - imuGyroBiasY;
-      wz = g.dps.z - imuGyroBiasZ;
-    }
-  } else {
-    imuStillSince = 0;
-  }
-  if (fabsf(wz) < 0.35f) wz = 0;
+  // 零偏已在上面按 imuStill 更新过，这里直接减；静止时顺手记一下 still 起点。
+  if (imuStill) { if (!imuStillSince) imuStillSince = now; }
+  else imuStillSince = 0;
+  // v7.14.3 陀螺也换到车身轴：绕"右"轴 = 俯仰角速度，绕"前"轴 = 横滚角速度，绕"上"轴 = 偏航。
+  // 旧代码直接拿 gyro X 当横滚、gyro Y 当俯仰，跟加速度计一样差了 90° —— 压弯时积分的是
+  // 俯仰率（≈0），所以 imuRoll 一直是 0，imuLeanSign 永远学不到 -1，横向 G 恒为正。
+  const float rawG[3] = { g.dps.x - imuGyroBiasX, g.dps.y - imuGyroBiasY, g.dps.z - imuGyroBiasZ };
+  float gR, gF, gU;
+  imuToBody(rawG, gR, gF, gU);
+  const float wPitch = gR, wRoll = gF;
+  float wYaw = gU;
+  if (fabsf(wYaw) < 0.35f) wYaw = 0;
 
-  // 加速度只在接近 1 g 时校正 roll/pitch，急加速/刹车时避免把线性加速度当重力。
-  const float accelWeight = fabsf(imuG - 1.0f) < 0.20f ? 0.04f : 0.0f;
-  const float gyroWeight = 1.0f - accelWeight;
-  // v7.13.4 真倾角：稳态压弯时合力正好沿车身竖直轴，atan2(ay,az) 会把倾角读成 ~0。
-  // 用去重力后的侧向比力把加速度基准补偿回来（tan(修正)=侧向比力/g），
-  // 静止时补偿量为 0，稳态压弯时恰好补回真实倾角，加减速（纵向）不影响 roll。
-  float arCorr = ar;
+  // ---- v7.14.0 roll ----
+  // 关键事实：稳态压弯时重力和向心加速度的合力正好沿车身竖直轴，所以车身"右""前"两个分量
+  // 都是 0、竖直分量 = 1/cos(φ)。也就是说 atan2(-aR,aU) 在压弯时恒等于 0 —— 加速度计在压弯
+  // 时拿不到倾角信息，分不出重力和向心加速度。这是老版本"压弯时 G 值不动"的根因。
+  // 正确做法：加速度计只用来给 |φ|（由合力大小反解，稳态压弯精确且与陀螺漂移无关），
+  // 符号交给陀螺积分。纵向加速度按 pitch 去掉，否则刹车会被误判成压弯。
+  // v7.14.3 lonNow 改成车身坐标：世界水平前方向 = cosθ·F − sinθ·U，所以
+  //   lonNow = aF·cosθ − aU·sinθ（θ 为俯仰）。静止时它恒等于 0，与安装俯仰无关。
+  const float thAbs = imuPitch * 0.017453293f;
+  const float lonNow = aF * cosf(thAbs) - aU * sinf(thAbs);          // 去重力后的纵向比力
+  const float latSq = imuG * imuG - 1.0f - lonNow * lonNow;          // 剩下的水平分量²
+
+  imuRoll += wRoll * dt;                                             // 高频靠陀螺
+  if (fabsf(imuRoll) > 3.0f) imuLeanSign = imuRoll > 0.0f ? 1.0f : -1.0f;
   {
-    const float phR = imuRoll * 0.017453293f;
-    const float latAcc = imuAy * cosf(phR) - imuAz * sinf(phR);   // 侧向比力（去重力，g）
-    if (fabsf(latAcc) > 0.015f) arCorr = ar + atan2f(-latAcc, fabsf(imuAz));
+    const float dev = fabsf(imuG - 1.0f);                              // 合力偏离 1g 多少
+    const float latMagDeg = latSq > 0.0f ? atanf(sqrtf(latSq)) * 57.2957795f : 0.0f;
+    // 观测 A（|f|≈1 时有效）：合力就是纯重力，atan2(ay,az) 就是真倾角，零漂。
+    // 静止放在桌上 / 直线匀速都属于这一档 —— 这是压住 LEAN 漂移的那一项。
+    float w1 = constrain(1.0f - (dev - 0.004f) / 0.010f, 0.0f, 1.0f);
+    // 观测 B（压弯时有效）：|f| = 1/cos φ 反解 |φ|，稳态压弯精确，符号靠陀螺。
+    // 双重门限：latMag 要到 8° 以上，且 |f| 偏离 1g 要明显超过噪声（否则静止时的
+    // 加速度噪声开根号会被放大成一个假的"8° 压弯"）。
+    float w2 = constrain((latMagDeg - 8.0f) / 10.0f, 0.0f, 1.0f);
+    w2 *= constrain((dev - 0.010f) / 0.006f, 0.0f, 1.0f);
+    w2 *= constrain(1.0f - (fabsf(lonNow) - 0.20f) / 0.25f, 0.0f, 1.0f);  // 纵向加速大时不信
+    // v7.14.2 "放着不动 LEAN 一直涨"的根治：静止判定成立时无条件、快速地信任加速度计。
+    //   原来的门限有个缝：imuStill 允许 dev 到 0.04，而 w1 在 dev=0.014 就已经衰减到 0 ——
+    //   落在 0.014~0.04 这一档时被判成静止（零偏照学）却没有任何绝对基准，姿态只能靠积分，
+    //   陀螺零偏残余就一点点累积上去。静止判定本身已经要求 |f|≈1 且陀螺方差极小，这时
+    //   atan2(ay,az) 就是倾角真值（纯重力，零漂），没有任何理由不直接用它把 roll 钉住。
+    //   时间常数从 0.8s 收到 0.10s：停下约 0.1s 内 LEAN 就回到真值，残余误差只有 bias*0.1s。
+    float tauObs = 0.8f;
+    if (imuStill) { w1 = 1.0f; w2 = 0.0f; tauObs = 0.10f; }
+    float obs = 0.0f, wsum = 0.0f;
+    if (w1 > 0.0f) { obs += w1 * ar;                     wsum += w1; }
+    if (w2 > 0.0f) { obs += w2 * imuLeanSign * latMagDeg; wsum += w2; }
+    if (wsum > 0.001f)
+      imuRoll += (obs / wsum - imuRoll) * (dt / (tauObs + dt)) * constrain(wsum, 0.0f, 1.0f);
   }
-  imuRoll = gyroWeight * (imuRoll + wx * dt) + accelWeight * arCorr;
-  imuPitch = gyroWeight * (imuPitch + wy * dt) + accelWeight * ap;
-  imuYaw = imuWrap180(imuYaw + wz * dt);
+
+  // pitch：压弯不影响俯仰，但**纵向加速会**——加速度计的 aF 里同时有 A·cosθ 和 sinθ，
+  // 所以 ap 在加速时会被抬高一个 A/g（0.3g 就是 17°）。旧门限用 |f|-1，0.3g 时还有 0.7 的
+  // 权重，pitch 被拉偏十几度，回头 lonNow 又要用 pitch 做补偿 → 纵向 G 直接算错。
+  // 改成按 |lonNow| 门限（纵向加速大就只信陀螺），静止时无条件快速钉到 ap。
+  {
+    float tauP = 0.45f;
+    float pTrust = constrain(1.0f - (fabsf(lonNow) - 0.12f) / 0.20f, 0.0f, 1.0f);
+    if (imuStill) { pTrust = 1.0f; tauP = 0.10f; }
+    imuPitch += wPitch * dt;
+    if (pTrust > 0.001f) imuPitch += (ap - imuPitch) * (dt / (tauP + dt)) * pTrust;
+  }
+  imuYaw = imuWrap180(imuYaw + wYaw * dt);
+
+  // ---- v7.14.0 侧向 / 纵向 G ----
+  // 加速度计测的是比力，水平加速时 |f|² = a_h² + 1，所以 a_h = sqrt(|f|²-1)；
+  // 再减掉纵向分量，剩下的就是侧向，稳态压弯时恒等于 tan(φ)：45° → 1.00G。
+  // 但 latA 有个致命盲区：**静止倾斜时它恒等于 0**。|f| 在静止时恒为 1g（不管车怎么歪），
+  // latSq = 1-1-0 = 0 —— 物理上没错（静态倾斜确实没有横向加速度），可用户侧倾车身时
+  // 球就一动不动。v7.14.3 之前的判据用 |lonNow|（纵向加速）来切换到 latB，判据选错了对象：
+  // 静止倾斜时 lonNow≈0 → wA=1 → 永远只用 latA=0，latB 一次都没用上。
+  // v7.14.4 改成按 |f| 偏离 1g 的多少来混合：
+  //   |f| 明显 > 1g（真在压弯/加速）→ latA 是实测真值，优先
+  //   |f| ≈ 1g（静止倾斜 / 直线）    → latB = tan(roll)，歪多少显示多少
+  // 稳态压弯时两者完全相等（latA = latB = tan φ），所以这个切换不改变压弯精度。
+  const float latA = latSq > 0.0f ? sqrtf(latSq) : 0.0f;
+  // v7.14.5 latB 必须用**相对倾角**（减掉 imuBiasRoll），跟屏幕上那个 LEAN 数字保持一致。
+  //   之前直接用绝对 imuRoll：只要板子装得有一点横滚偏置（或者用户点屏归过零），
+  //   LEAN 显示 0.0 而球却按绝对倾角跑 —— 静止时 G 显示 tan(52°)=1.3、球死死顶在 RIGHT，
+  //   就是这个原因。屏幕上两个数字必须来自同一个角度。
+  const float rollRel = imuWrap180(imuRoll - imuBiasRoll);
+  const float latB = tanf(constrain(rollRel * 0.017453293f, -1.1f, 1.1f));
+  imuRollRel = rollRel; imuLatBDbg = latB;
+  // 直线骑行时车身本来就有 ±1° 的微摆（路面横坡、把手的微修正），tan(1°)≈0.017 正好卡在
+  // 显示死区 0.02 边上，会让球在直线上抖。3° 以下按比例降权（3° 以上全信，对应 0.05G 以上，
+  // 早就在死区之上了），所以不影响真正的压弯和桌面倾斜测试。
+  const float bTrust = constrain((fabsf(rollRel) - 1.0f) / 2.0f, 0.0f, 1.0f);
+  float wA = constrain((imuG - 1.0f) / 0.03f, 0.0f, 1.0f);                    // |f|>1.03 才完全信实测
+  wA *= constrain(1.0f - (fabsf(lonNow) - 0.20f) / 0.25f, 0.0f, 1.0f);        // 纵向加速大时 lonNow 不可靠
+  const float latRaw = (wA * latA + (1.0f - wA) * fabsf(latB) * bTrust) * imuLeanSign * G_LEAN_SIGN;
+  const float kd = dt / (0.09f + dt);                                // 90ms 显示平滑
+  imuLatG += (latRaw - imuLatG) * kd;
+  imuLonG += (lonNow - imuLonG) * kd;
+  {
+    const float m = sqrtf(imuLatG * imuLatG + imuLonG * imuLonG);
+    if (m > imuPeakG) imuPeakG = m;
+  }
 }
 // v7.13.3 G 值表（gg 图）：黑底 + 蓝色分段弧刻度（1.0g 内圈 / 1.5g 外圈）+ 黄绿 G 矢量圆点 + 中央合 G 数字。
-// 加速度先按 roll/pitch 去重力，得到水平系的侧向/纵向 G（压弯时比 |g|-1 准）；点屏幕重置零点和峰值。
-static void imuArcSeg(float cx, float cy, float r, float a0, float a1, uint16_t c) {
+// v7.13.7 边缘黄圈重做：贴屏边（r229）、静止 10px 厚 / 亮度 140，底部留缺口给翻页点。
+// v7.13.8 黄圈随 G 向内扩长（10 → 34px）并把颜色从黄推到橙再推到红；矢量点跟着同一个颜色走。
+// v7.14.0 算法重做：侧向/纵向 G 改在 imuTick 里按 dt 归一计算，压弯时不再是 0.00G；点屏幕重置零点和峰值。
+// v7.14.2 边缘环改扫描线面积填充，彻底消掉环上的黑色针孔。
+static void imuArcSeg(float cx, float cy, float r, float a0, float a1, uint16_t c, float step = 3.0f) {
   const float D = 0.017453293f;
   float px = cx + cosf(a0 * D) * r, py = cy + sinf(a0 * D) * r;
-  for (float a = a0 + 3; a <= a1 + 0.01f; a += 3) {
-    float nx = cx + cosf(a * D) * r, ny = cy + sinf(a * D) * r;
+  for (float a = a0; a < a1 - 0.01f; ) {
+    float na = a + step; if (na > a1) na = a1;          // 末段收到 a1，弧线不会提前断掉
+    float nx = cx + cosf(na * D) * r, ny = cy + sinf(na * D) * r;
     gfx->drawLine((int)px, (int)py, (int)nx, (int)ny, c);
-    px = nx; py = ny;
+    px = nx; py = ny; a = na;
+  }
+}
+// v7.14.2 边缘环改成"扫描线面积填充"。
+//   病根：1px 的圆（drawCircle 中点法）在 45° 方向天然留棋盘格针孔；之前用 6° 一段的折线（弦）
+//   也一样 —— 相邻半径的 Bresenham 阶梯互相对不齐，34 圈叠起来针孔还对得整整齐齐。实测环带
+//   内有 12%~15% 的像素是纯黑，屏幕上就是一圈圈"黑色空隙"。把折线步长改细（1°/0.5°）只会让
+//   针孔更密，治不了 —— 只有面积填充才行。
+//   做法：每一带是一个薄圆环（rIn < r <= rOut），逐行求出 [cx-xo, cx-xi-1] 和 [cx+xi+1, cx+xo]
+//   两段水平线，段内像素全填，环带内针孔数为 0。
+static void ringBand(int cx, int cy, int rOut, int rIn, uint16_t col) {
+  if (rOut < 1) return;
+  if (rIn < 0) rIn = 0;
+  if (rIn >= rOut) return;
+  const int rOut2 = rOut * rOut, rIn2 = rIn * rIn;
+  for (int y = cy - rOut; y <= cy + rOut; y++) {
+    const int dy = y - cy, dy2 = dy * dy;
+    if (dy2 > rOut2) continue;
+    const int xo = (int)sqrtf((float)(rOut2 - dy2));
+    if (xo <= 0) { gfx->drawPixel(cx, y, col); continue; }
+    if (dy2 >= rIn2) { gfx->drawFastHLine(cx - xo, y, xo * 2 + 1, col); continue; }  // 上下两端整条弦
+    const int xi = (int)sqrtf((float)(rIn2 - dy2));
+    if (xo <= xi) continue;
+    gfx->drawFastHLine(cx - xo, y, xo - xi, col);          // 左半段
+    gfx->drawFastHLine(cx + xi + 1, y, xo - xi, col);      // 右半段
   }
 }
 void drawImuPage(){
   onWaitScreen = false;
   gfx->fillScreen(C_BLACK);
-  const uint16_t C_CHART = 0xCEA0;   // 黄绿（点 / 外圈光晕）
-  const uint16_t C_GBLUE = 0x3CFF;   // 刻度蓝
+  const uint16_t C_GBLUE = 0x3CFF;   // 刻度蓝（边缘黄圈的颜色见下面 ringCol）
   if(!imuOK){ printCentered("QMI8658 NOT FOUND",CX,190,2,C_RED); drawPageDots(); needFlush=true; return; }
   const float cyG = 233;                           // v7.13.4 仪表几何居中（画布中心）
-  // ---- 去重力：水平系侧向 / 纵向加速度（g）。轴约定与 roll/pitch 一致：
-  //      X = 前后（pitch 绕 Y），Y = 左右（roll 绕 X）。yLat = 侧向，xLon = 纵向 ----
-  const float ph = imuWrap180(imuRoll - imuBiasRoll) * 0.017453293f;
-  const float th = imuWrap180(imuPitch - imuBiasPitch) * 0.017453293f;
-  const float xLon = imuAx * cosf(th) + imuAz * sinf(th);
-  const float z1 = -imuAx * sinf(th) + imuAz * cosf(th);
-  const float yLat = imuAy * cosf(ph) - z1 * sinf(ph);
-  static float sLat = 0, sLon = 0;                 // 显示平滑
-  sLat += (yLat - sLat) * 0.35f;
-  sLon += (xLon - sLon) * 0.35f;
+  // ---- v7.14.6 还原成基线 v7.13.1 的做法：在绘制层把比力按 roll/pitch 反旋到水平系 ----
+  // 基线是用原始 imuAx/imuAy/imuAz 直接投影，这里保留完全一样的思路，只把轴换成修正后的
+  // 车身坐标（右/前/上）—— 否则纵向会取到横向轴，就是"球只往 RIGHT 走"那个老问题。
+  // 符号按车身坐标重新推过：静止侧倾 φ 时 lat ≡ 0；稳态压弯时 lat ≡ tan φ
+  // （基线原来那一项是 `- z1·sin(φ)`，符号反了，所以压弯时侧向 G 一直是 0）。
+  const float phR = imuWrap180(imuRoll - imuBiasRoll) * 0.017453293f;
+  const float thR = imuWrap180(imuPitch - imuBiasPitch) * 0.017453293f;
+  const float lonRaw = imuBodyF * cosf(thR) - imuBodyU * sinf(thR);    // 纵向（水平前向）
+  const float upRaw  = imuBodyF * sinf(thR) + imuBodyU * cosf(thR);    // 去俯仰后的竖直分量
+  const float latRaw = imuBodyR * cosf(phR) + upRaw * sinf(phR);       // 侧向（水平右向）
+  static float sLat = 0, sLon = 0;                 // 与基线一致的 0.35 一阶平滑
+  sLat += (latRaw - sLat) * 0.35f;
+  sLon += (lonRaw - sLon) * 0.35f;
   float mag = sqrtf(sLat * sLat + sLon * sLon);
   if (mag > imuPeakG) imuPeakG = mag;
+  if (mag < 0.02f) mag = 0.0f;                     // 静止死区：末位不再在 0.00/0.01 之间乱跳
+  {                                                // 显示滞环：变化不到半个末位就不重画，消掉抖字
+    static float shownMag = -1.0f;
+    if (shownMag < 0.0f || fabsf(mag - shownMag) >= 0.006f) shownMag = mag;
+    mag = shownMag;
+  }
   // ---- 刻度：内圈 1.0g（r118）外圈 1.5g（r176），四个方向留缺口 ----
   for (int k = 0; k < 2; k++)
     for (int s = 0; s < 4; s++) {
@@ -1505,11 +1629,35 @@ void drawImuPage(){
     gfx->drawLine((int)(CX + cosf(a) * 52), (int)(cyG + sinf(a) * 52),
                   (int)(CX + cosf(a) * 64), (int)(cyG + sinf(a) * 64), C_GBLUE);
   }
-  // ---- 外圈光晕：厚度随 G 增长（静止 4px → 满表 10px），亮度同步增强，外缘亮内缘暗 ----
-  const int glowT = constrain(4 + (int)(mag * 4.0f), 4, 10);
-  const int glowC = constrain(60 + (int)(mag * 150), 60, 255);
-  for (int i = 0; i < glowT; i++)
-    gfx->drawCircle(CX, cyG, 205 - i, blend565(C_BLACK, C_CHART, constrain(glowC - i * 14, 30, 255)));
+  // ---- 边缘黄圈（v7.13.8）：外沿贴边 r229（离屏边 4px），随 G 向圆心扩长 10 → 44px（二次曲线：
+  //      常用倾角保持细，接近满量程才迅速加厚）。颜色按整条量程铺开：0 → 0.7g 黄→橙，
+  //      0.7 → 1.3g 橙→红，1.3g 以上全红；亮度 140 → 255，外缘最亮、每向内 1px 减 3。
+  //      底部留 28° 缺口（104°~436°）给翻页圆点，缺口角度和 1.0g/1.5g 刻度弧的四个缺口一致。----
+  const uint16_t ringCol = mag <= 0.7f ? blend565(C_YELLOW, C_ORANGE, (int)(mag * 364.0f))
+                        : mag <= 1.3f ? blend565(C_ORANGE, C_RED, (int)((mag - 0.7f) * 425.0f))
+                                      : C_RED;
+  {
+    const float gk = constrain(mag / 1.5f, 0.0f, 1.0f);
+    const int thick = 10 + (int)(gk * gk * 34.0f + 0.5f);   // 二次曲线：常用倾角保持细，接近满量程才迅速加厚
+    const int bright = 140 + (int)(gk * 115.0f + 0.5f);
+    // v7.14.2 分 16 带扫描填充（带内同色、带间只差 1~2 个 565 阶，看上去还是连续渐变）。
+    //          单带宽度 2~3px，所以"外缘最亮、每向内 1px 减 3"的效果基本保留。
+    const int bands = 16;
+    for (int k = 0; k < bands; k++) {
+      const int i0 = k * thick / bands;                    // 本带最外一圈的"向内缩进"量
+      int i1 = (k + 1) * thick / bands - 1;
+      if (i1 < i0) i1 = i0;
+      const int ro = 229 - i0, ri = ro - (i1 - i0 + 1);
+      const int imid = i0 + (i1 - i0) / 2;                 // 取带中点算亮度
+      ringBand(CX, cyG, ro, ri, blend565(C_BLACK, ringCol, constrain(bright - imid * 3, 40, 255)));
+    }
+    // 底部 28° 缺口（±14°，tan14°=0.2493）给翻页圆点让位：逐行扇形填充，边缘干净、没有毛刺。
+    // 必须画在文字之前，否则会把 REAR 擦掉。
+    for (int y = cyG; y < 466; y++) {
+      const int half = (int)((y - cyG) * 0.2493f);
+      if (half > 0) gfx->drawFastHLine(CX - half, y, half * 2 + 1, C_BLACK);
+    }
+  }
   // ---- 方向标注（内外圈之间的缺口带）+ 量程小字 ----
   printCentered("FRONT", CX, cyG - 162, 2, C_GBLUE);
   printCentered("REAR",  CX, cyG + 148, 2, C_GBLUE);
@@ -1524,18 +1672,29 @@ void drawImuPage(){
   printCentered(b, CX, cyG - 24, 5, vc);
   snprintf(b, sizeof(b), "LEAN %+5.1f deg", imuWrap180(imuRoll - imuBiasRoll));
   printCentered(b, CX, cyG + 34, 2, C_GREY);
+#if IMU_SHOW_AXES
+  snprintf(b, sizeof(b), "F%+5.2f R%+5.2f U%4.2f", imuBodyF, imuBodyR, imuBodyU);
+  printCentered(b, CX, cyG + 168, 1, 0x630C);
+  snprintf(b, sizeof(b), "RLL%+6.1f LATB%+5.2f", imuRollRel, imuLatBDbg);
+  printCentered(b, CX, cyG + 180, 1, 0x630C);
+#endif
   // ---- G 矢量圆点（限幅 1.5g 内；最后画，浮在数字上面。sLat = 侧向，sLon = 纵向）----
-  float dl = sqrtf(sLat * sLat + sLon * sLon);
-  if (dl > 1.5f) { sLat *= 1.5f / dl; sLon *= 1.5f / dl; }
-  aaDisc(CX + sLat * 118.0f, cyG - sLon * 118.0f, 17, C_CHART);
+  // v7.13.7 限幅只作用在显示坐标上：以前直接改 sLat/sLon，超量程时会把平滑状态一起改掉，
+  //          松回来的一瞬间圆点会从限幅值往回跳。
+  // v7.13.8 圆点跟黄圈同色，G 变大一起走 黄 → 橙 → 红。
+  const float dl = sqrtf(sLat * sLat + sLon * sLon);
+  const float mk = dl > 1.5f ? 1.5f / dl : 1.0f;
+  aaDisc(CX + sLat * mk * 118.0f, cyG - sLon * mk * 118.0f, 17, ringCol);
   drawPageDots(); needFlush=true;
 }
 
+#include "TpmsPage.h"
+
 void drawPageDots() {
   if (page == PAGE_HOME && inNav) return;
-  const int pageOrder[] = {PAGE_MUSIC, PAGE_HOME, PAGE_IMU, PAGE_WEATHER};
-  for (int i = 0; i < 4; i++) {
-    aaDisc(CX + (i - 1.5f) * 20, 444, 4, page == pageOrder[i] ? C_WHITE : 0x4208);
+  const int pageOrder[] = {PAGE_MUSIC, PAGE_TPMS, PAGE_HOME, PAGE_IMU, PAGE_WEATHER};
+  for (int i = 0; i < 5; i++) {
+    aaDisc(CX + (i - 2.0f) * 20, 444, 4, page == pageOrder[i] ? C_WHITE : 0x4208);
   }
 }
 
@@ -1543,6 +1702,7 @@ void drawWaiting(int st) {
   waitSt = st;
   if (sliding) return;                                                 // v5.5 正在滑动：滑完再画
   if (page == PAGE_MUSIC) { onWaitScreen = false; musicDirty = true; return; }
+  if (page == PAGE_TPMS) { drawTpmsPage(); return; }
   if (page == PAGE_IMU || page == PAGE_WEATHER) { onWaitScreen = false; wxDirty = (page == PAGE_WEATHER); return; }
   gfx->fillScreen(C_BLACK);
   drawBackground();
@@ -1839,6 +1999,7 @@ void touchPoll() {
       if (page == PAGE_MUSIC && abs(touchX1 - touchX0) < 60 && abs(touchY1 - touchY0) < 60) musicTap(touchX0, touchY0);
       if (page == PAGE_WEATHER && abs(touchX1 - touchX0) < 36 && abs(touchY1 - touchY0) < 36) weatherTap();
       if (page == PAGE_IMU && abs(touchX1 - touchX0) < 36 && abs(touchY1 - touchY0) < 36) imuResetReference();
+      if (page == PAGE_TPMS && abs(touchX1 - touchX0) < 36 && abs(touchY1 - touchY0) < 36) tpmsTap(touchX0, touchY0);   // 双击切备注
       dragEnd();
     }
     touchEat = false;
@@ -2232,6 +2393,7 @@ void renderPage(int p) {
   bool ks = sliding;
   page = p; sliding = false;
   if (p == PAGE_MUSIC) drawMusic();
+  else if (p == PAGE_TPMS) drawTpmsPage();
   else if (p == PAGE_IMU) drawImuPage();
   else if (p == PAGE_WEATHER) drawWeather();
   else if (inNav) drawNavFrame();
@@ -2346,6 +2508,8 @@ void slideCommit() {
     onWaitScreen = false;
     wxDirty = false;
     if (!wxHave || millis() - wxAt > 15UL * 60 * 1000) { pendingEvt = "T,W"; wxAskAt = millis(); }
+  } else if (page == PAGE_TPMS || page == PAGE_IMU) {
+    onWaitScreen = false;
   } else {
     if (inNav) navDirty = true;
     else { riderPrevF = -1; riderPrevZ = -2; catForce = true; }
@@ -2358,6 +2522,7 @@ void slideCancel() {
   renderPage(page);
   if (page == PAGE_MUSIC) musicDirty = true;
   else if (page == PAGE_WEATHER) wxDirty = false;
+  else if (page == PAGE_TPMS || page == PAGE_IMU) onWaitScreen = false;
   else if (inNav) navDirty = true;
   else { onWaitScreen = true; catForce = true; }
   needFlush = true;
@@ -2410,15 +2575,22 @@ void dragMove(int dx, int dy, unsigned long now) {
   // vx 取反：实机左右滑动方向与页面切换方向的对应关系（0° 行为与旧版一致）。
   float vx = -(float)dx, vy = dy;
   dx = (int)lroundf(vx); dy = (int)lroundf(vy);
+  // 胎压页：竖直拖卡片 = 上下换位，优先于换页（换页在胎压页只走左右）
+  if (tpmsSwapActive()) { tpmsSwapMove(dy); return; }
   if (!dragging) {
     int threshold = page == PAGE_MUSIC ? 36 : DRAG_START;
     if (abs(dx) < threshold && abs(dy) < threshold) return;
+    if (page == PAGE_TPMS && abs(dy) > abs(dx) && tpmsSwapBegin(touchX0, touchY0)) {
+      tpmsSwapMove(dy);
+      return;
+    }
     dragHoriz = abs(dx) >= abs(dy);
     int d = dragHoriz ? dx : dy;
     dragSign = d > 0 ? 1 : -1;
-    if (page == PAGE_MUSIC) { if (!dragHoriz || dragSign > 0) return; dragTarget = PAGE_HOME; }
+    if (page == PAGE_MUSIC) { if (!dragHoriz || dragSign > 0) return; dragTarget = PAGE_TPMS; }
     else if (page == PAGE_WEATHER) { if (!dragHoriz || dragSign < 0) return; dragTarget = PAGE_IMU; }
-    else if (dragHoriz && page == PAGE_HOME) dragTarget = dragSign < 0 ? PAGE_IMU : PAGE_MUSIC;
+    else if (dragHoriz && page == PAGE_TPMS) dragTarget = dragSign < 0 ? PAGE_HOME : PAGE_MUSIC;
+    else if (dragHoriz && page == PAGE_HOME) dragTarget = dragSign < 0 ? PAGE_IMU : PAGE_TPMS;
     else if (dragHoriz && page == PAGE_IMU) dragTarget = dragSign < 0 ? PAGE_WEATHER : PAGE_HOME;
     else return;
     if (!slidePrepare(dragTarget)) return;
@@ -2435,6 +2607,7 @@ void dragMove(int dx, int dy, unsigned long now) {
 
 // 松手：拖过 30% 或者往前甩出去 → 顺势滑完；否则弹回
 void dragEnd() {
+  if (tpmsSwapActive()) { tpmsSwapFinish(); return; }     // 胎压卡片换位
   if (!dragging) return;
   int full = dragHoriz ? LCD_WIDTH : LCD_HEIGHT;
   bool go = dragP > full * 0.3f || (dragV > 0.35f && dragP > 24);
@@ -2449,11 +2622,13 @@ void dragEnd() {
 
 // 来电等情况：直接放弃拖动
 void dragAbort() {
+  if (tpmsSwapActive()) tpmsSwapCancel();                 // 胎压卡片弹回原位
   if (!dragging) return;
   sliding = false; dragging = false;
   if (page == PAGE_MUSIC) musicDirty = true;
   else if (page == PAGE_WEATHER) wxDirty = true;
   else if (page == PAGE_IMU) drawImuPage();
+  else if (page == PAGE_TPMS) drawTpmsPage();
   else if (inNav) navDirty = true;
 }
 
@@ -3020,7 +3195,12 @@ void handleText(const String &m) {
     if (r == 1 || r == 2) { trailMode = r; navDirty = true; }
     return;
   }
-  if (m.startsWith("#m,")) { mapOn = m.substring(3).toInt() != 0; navDirty = true; return; }
+  if (m.startsWith("#m,")) {                             // v7.13.6 0 关小地图 / 1 小地图 / 2 强制大箭头
+    int mv = m.substring(3).toInt();
+    mapOn = mv != 0;                                     // 2 也算"地图开着"：底图继续收，只是不画
+    forceArrow = (mv == 2);
+    navDirty = true; return;
+  }
   if (m.startsWith("#b,")) {
     int b = constrain(m.substring(3).toInt(), 5, 255);
     if (flushDone) {                                    // v2.2 刷屏任务在用总线时先等它推完
@@ -3105,7 +3285,7 @@ void setup() {
   backlightPWM=ledcAttach(LCD_BL,20000,8);
   Wire.begin(IIC_SDA, IIC_SCL);
   imuOK=imu.begin(Wire,0x6B,IIC_SDA,IIC_SCL); if(!imuOK) imuOK=imu.begin(Wire,0x6A,IIC_SDA,IIC_SCL);
-  if(imuOK){ imu.configAccel(SensorQMI8658::AccelRange::FS_8G,SensorQMI8658::AccelODR::ODR_112Hz); imu.configGyro(SensorQMI8658::GyroRange::FS_512DPS,SensorQMI8658::GyroODR::ODR_112Hz); imu.enableAccel(); imu.enableGyro(); }
+  if(imuOK){ imu.configAccel(SensorQMI8658::AccelRange::FS_8G,SensorQMI8658::AccelODR::ODR_112Hz,SensorQMI8658::LpfMode::MODE_1); imu.configGyro(SensorQMI8658::GyroRange::FS_512DPS,SensorQMI8658::GyroODR::ODR_112Hz,SensorQMI8658::LpfMode::MODE_3); imu.enableAccel(); imu.enableGyro(); }   // v7.14.0 打开片上 LPF：加速度 3.63%（≈4Hz，压 G 值噪声），陀螺 13.37%（≈15Hz，少一点积分滞后）
   touchInit();                                         // v5.2 触摸屏
   batInit();                                           // v6.8 电源芯片（电量）
 
@@ -3362,6 +3542,14 @@ void loop() {
   bool mapNow = inNav && mapModeActive();
   if (mapNow != wasMap) { wasMap = mapNow; navDirty = true; }   // 进出地图模式时整帧重画
   if (mapNow) navDirty = true;
+  // v7.13.5 拥堵提醒环的脉冲要有自己的节拍：小地图模式本来就每圈重绘，大箭头页只在
+  // 行程环数值变化时才重绘，只靠数据触发会让脉冲冻在某一相位（看起来像坏了）。
+  // 大箭头页的外圈不受 1.5km 限制，所以这里用 trafficAlertOn(false)
+  static unsigned long alertPulseAt = 0;
+  if (!mapNow && trafficAlertOn(false) && millis() - alertPulseAt >= 120) {
+    alertPulseAt = millis();
+    navDirty = true;
+  }
 
   touchPoll();                                         // v5.2 按住接听 / v5.3 滑动换页
   batPoll();                                           // v6.8 电量
@@ -3379,6 +3567,7 @@ void loop() {
     if (page == PAGE_MUSIC) musicDirty = true;
     else if (page == PAGE_WEATHER) wxDirty = true;
     else if (page == PAGE_IMU) drawImuPage();
+    else if (page == PAGE_TPMS) drawTpmsPage();
     else if (inNav) navDirty = true;
     else drawWaiting(conn ? WAIT_READY : WAIT_NOLINK);
   }
@@ -3395,6 +3584,7 @@ void loop() {
     if (page == PAGE_MUSIC) musicDirty = true;
     else if (page == PAGE_WEATHER) wxDirty = true;
     else if (page == PAGE_IMU) drawImuPage();
+    else if (page == PAGE_TPMS) drawTpmsPage();
     else if (inNav) navDirty = true;
     else drawWaiting(conn ? WAIT_READY : WAIT_NOLINK);
   }
@@ -3415,6 +3605,7 @@ void loop() {
       if (page == PAGE_MUSIC) musicDirty = true;
       else if (page == PAGE_WEATHER) wxDirty = true;
       else if (page == PAGE_IMU) drawImuPage();
+      else if (page == PAGE_TPMS) drawTpmsPage();
       else if (inNav) navDirty = true;
       else drawWaiting(conn ? WAIT_READY : WAIT_NOLINK);
     }
@@ -3422,6 +3613,13 @@ void loop() {
 
   musicTick();
   weatherTick();                                       // v5.3 天气页
+  if (page == PAGE_TPMS && !sliding && !callOn && !pairOn && !tpmsSwapActive()) {
+    static uint32_t tpmsDrawAt = 0;
+    if (millis() - tpmsDrawAt >= 1000) {
+      tpmsDrawAt = millis();
+      drawTpmsPage();
+    }
+  }
   if (inNav && navDirty && !fxOn && !callOn && !pairOn && page == PAGE_HOME && !sliding) {
     drawNavFrame();
     navDirty = false;
@@ -3454,3 +3652,29 @@ void loop() {
   }
   delay(mapNow ? 1 : 10);
 }
+
+#ifdef HOST_SIM
+// PC 模拟器（simulator/）的注入钩子：设备构建不定义 HOST_SIM，这段不参与编译。
+void hostSimInjectRx(const uint8_t *data, size_t n) {
+  if (!data || n == 0 || n > RXQ_MAX) return;
+  portENTER_CRITICAL(&mux);
+  int next = (rxHead + 1) % RXQ_SLOTS;
+  if (next == rxTail) rxTail = (rxTail + 1) % RXQ_SLOTS;
+  rxq[rxHead].len = n;
+  memcpy(rxq[rxHead].data, data, n);
+  rxHead = next;
+  portEXIT_CRITICAL(&mux);
+}
+
+void hostSimSetLink(bool conn, bool auth) {
+  bleConnected = conn;
+  bleAuthed = auth;
+  if (conn) {
+    bleConnHandle = 1;
+    bleConnAt = millis();
+    if (auth) { bleAuthAt = millis(); authNotifies = 0; }
+  } else {
+    bleConnHandle = 0xFFFF;
+  }
+}
+#endif

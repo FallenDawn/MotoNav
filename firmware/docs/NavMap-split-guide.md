@@ -80,8 +80,8 @@ NavMap.h 的每个 extern 都要在目标板 MotoNav.cpp 里 grep 确认存在�
 - c3 板没有 IdlePowerOff 模块（无该头文件）：如头里出现相关项则删（185b 版没写，无需动）。
 - 其余（themeIdx/curveOn/nightOn/trailMode/bld3dOn/mapOn、posX 系列、traf 系列、MCAM 数组、
   ringActive、pendingAck 等）两板都有，照抄。
-- `STAGE_FAR_M / STAGE_NEAR_M` 两个 define 照抄（主文件顶部有同值定义，重复定义同值宏合法；
-  想干净也可以把主文件那份删掉）。
+- `STAGE_FAR_M / STAGE_NEAR_M` 是导航渲染内部配置，只在 NavMap.cpp 的 include 后定义一次；
+  从主文件移走，NavMap.h 不放这两个宏。`STALE_MS` 仍由主文件 loop 使用，留在主文件。
 - `THEME_N` define 照抄（主文件 handleText 里 `t < THEME_N` 要用，定义已随小地图段搬走）。
 - `MAP_RX_LOG` 宏：**两板的 handleBulk 都没有这个日志宏**（老分支），不用搬，头文件里也不用加。
 
@@ -216,7 +216,15 @@ NavMap.cpp 的 include 之后**。static inline 函数每个编译单元一份�
 6. **enum MotoNavPage**（如主文件有）：删掉，枚举在 MotoNavCommon.h。175/c3 用裸数字则跳过。
 
 7. 主文件顶部原有的 `void drawCompassBlip(...)` / `void drawLanesAt(...)` /
-   `void drawBackground()` 前置声明**保留不动**（与头文件重复声明合法）。
+   `void drawBackground()` 前置声明可以清理：drawCompassBlip 只在 NavMap.cpp 使用，
+   其声明放在 NavMap.cpp；另外两个已由头文件声明，主文件不再重复声明。
+
+8. **清理拆分遗留的重复项**（185b 已清理，迁移其他板时核对实际值后再删）：
+   - 颜色、屏幕几何、布局、`ICON_BUF_W/H` 统一定义在 MotoNavCommon.h，主文件不重复。
+   - `MCAM_MAX`、`THEME_N`、`TRAF_MAX` 统一定义在 NavMap.h，NavMap.cpp 不重复。
+   - 若主文件和 NavMap.cpp 都使用 `MAP_RX_LOG`，统一在 NavMap.h 定义一次。
+   - 主文件不再使用 miniz 和 DragonRadar 时删除相应 include；NavMap.cpp 保留直接依赖。
+   - 删除已有头文件声明的重复前置声明，以及定义之后多余的 blendF 声明。
 
 ---
 

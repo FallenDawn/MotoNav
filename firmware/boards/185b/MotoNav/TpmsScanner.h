@@ -12,8 +12,9 @@
 // 少抢导航数据的无线电时间；没连手机时恢复连续扫描（同原 App 的 LOW_LATENCY）。
 //
 // 用法：setup() 里 BLE 广播开始后 tpmsBegin()；loop() 里 tpmsTick(连着手机与否)；
-//       数据用 tpmsCount()/tpmsGet() 取，报警位用 tpmsAlarmBits() 算。画面显示后续再加。
+//       数据用 tpmsCount()/tpmsGet() 取，报警位用 tpmsAlarmBits() 算。显示由 TpmsPage.h 提供。
 #pragma once
+#include "TpmsData.h"
 
 #if defined(CONFIG_NIMBLE_ENABLED)
 
@@ -23,7 +24,6 @@
 #include <string.h>
 
 // ---- 可调参数 ----
-#define TPMS_MAX_SENSORS   4       // 最多记住几个传感器（两轮 + 备胎够用）
 #define TPMS_DEDUP_MS      500     // 同一 MAC 500ms 内的重复广播忽略（同原 App 防抖）
 #define TPMS_SCAN_INT_BUSY 200     // 连着手机：扫描间隔 ms（占空比 25%）
 #define TPMS_WIN_BUSY       50
@@ -32,50 +32,6 @@
 #define TPMS_RESTART_MS  300000    // 5 分钟重启扫描并清结果表：NimBLE 结果表上限 255 台，满了会丢新设备
 #define TPMS_DEBUG_MS     15000    // 每个传感器至少隔这么久才打一条串口日志
 
-// ---- 轮位绑定（现在只有数据结构，绑定界面/设置后续做） ----
-enum TpmsWheel : uint8_t {
-  TPMS_WHEEL_NONE = 0, TPMS_WHEEL_FRONT, TPMS_WHEEL_REAR,
-  TPMS_WHEEL_FL, TPMS_WHEEL_FR, TPMS_WHEEL_RL, TPMS_WHEEL_RR,
-};
-
-// ---- 报警位（阈值判定 + 传感器自报 flags 原样透传，UI 层决定怎么提示） ----
-enum TpmsAlarm : uint16_t {
-  TPMS_ALARM_LOW_PRESSURE  = 0x0001,   // 压力 < pressureLowBar（默认 1.7）
-  TPMS_ALARM_HIGH_PRESSURE = 0x0002,   // 压力 > pressureHighBar（默认 3.0）
-  TPMS_ALARM_HIGH_TEMP     = 0x0004,   // 温度 > tempHighC（默认 60 ℃）
-  TPMS_ALARM_LOW_BATT      = 0x0008,   // 电量 < battLowPct（默认 20%）
-  TPMS_SENSOR_LOW_VOLTAGE  = 0x0100,   // 以下 4 位是传感器 flags 里自报的
-  TPMS_SENSOR_AIR_LEAK     = 0x0200,
-  TPMS_SENSOR_PRESSURIZING = 0x0400,
-  TPMS_SENSOR_LOW_PRESSURE = 0x0800,
-};
-
-struct TpmsReading {
-  bool     present;                 // 槽位有效
-  uint8_t  mac[6];                  // 显示序 AA:BB:CC:DD:EE:FF（mac[0]=AA）
-  uint8_t  proto;                   // 1=SY 2=YC
-  uint8_t  wheel;                   // TpmsWheel，默认 NONE
-  uint8_t  statusFlags;             // 传感器原始 flags（bit0..3 见上）
-  int8_t   rssi;
-  float    voltage;                 // V
-  float    pressureBar;             // Bar（内部基准单位，显示时再换算）
-  int16_t  tempC;
-  uint8_t  batteryPct;              // 0-100
-  uint32_t lastMs;                  // 最后一次有效帧（判掉线用）
-  uint32_t frames;                  // 累计有效帧数（调试）
-  uint32_t dedupDropped;            // 被 500ms 防抖丢掉的帧数（调试）
-};
-
-// 报警阈值（默认值同原 App，单位 Bar / ℃ / %）
-struct TpmsThresholds {
-  float   pressureLowBar = 1.7f;
-  float   pressureHighBar = 3.0f;
-  int16_t tempHighC = 60;
-  uint8_t battLowPct = 20;
-};
-static TpmsThresholds tpmsThresholds;
-
-static TpmsReading tpmsDevs[TPMS_MAX_SENSORS];
 static uint32_t tpmsCrcFails = 0;       // YC CRC 没过的帧数（调试）
 static uint32_t tpmsRingOverflows = 0;  // 环形队列满了丢掉的帧数（调试）
 
@@ -229,45 +185,6 @@ class TpmsScanCallbacks : public BLEAdvertisedDeviceCallbacks {
 };
 
 // ---------- 数据表 ----------
-static __attribute__((unused)) uint8_t tpmsCount() {
-  uint8_t c = 0;
-  for (int i = 0; i < TPMS_MAX_SENSORS; i++) if (tpmsDevs[i].present) c++;
-  return c;
-}
-static __attribute__((unused)) TpmsReading *tpmsGet(int i) { return (i >= 0 && i < TPMS_MAX_SENSORS) ? &tpmsDevs[i] : nullptr; }
-static int tpmsFindByMac(const uint8_t mac[6]) {
-  for (int i = 0; i < TPMS_MAX_SENSORS; i++)
-    if (tpmsDevs[i].present && !memcmp(tpmsDevs[i].mac, mac, 6)) return i;
-  return -1;
-}
-static __attribute__((unused)) TpmsReading *tpmsFindByWheel(uint8_t wheel) {
-  for (int i = 0; i < TPMS_MAX_SENSORS; i++)
-    if (tpmsDevs[i].present && tpmsDevs[i].wheel == wheel) return &tpmsDevs[i];
-  return nullptr;
-}
-static __attribute__((unused)) void tpmsSetWheel(const uint8_t mac[6], uint8_t wheel) {
-  int i = tpmsFindByMac(mac);
-  if (i >= 0) tpmsDevs[i].wheel = wheel;
-}
-// 最近 ms 内有帧才算在线（传感器几秒广播一次，15 秒没动静基本就是走了/没电了）
-static __attribute__((unused)) bool tpmsFresh(const TpmsReading *d, uint32_t ms = 15000) {
-  return d && d->present && millis() - d->lastMs < ms;
-}
-
-static __attribute__((unused)) uint16_t tpmsAlarmBits(const TpmsReading *d) {
-  if (!d || !d->present) return 0;
-  uint16_t a = 0;
-  if (d->pressureBar < tpmsThresholds.pressureLowBar) a |= TPMS_ALARM_LOW_PRESSURE;
-  if (d->pressureBar > tpmsThresholds.pressureHighBar) a |= TPMS_ALARM_HIGH_PRESSURE;
-  if (d->tempC > tpmsThresholds.tempHighC) a |= TPMS_ALARM_HIGH_TEMP;
-  if (d->batteryPct < tpmsThresholds.battLowPct) a |= TPMS_ALARM_LOW_BATT;
-  if (d->statusFlags & 0x01) a |= TPMS_SENSOR_LOW_VOLTAGE;
-  if (d->statusFlags & 0x02) a |= TPMS_SENSOR_AIR_LEAK;
-  if (d->statusFlags & 0x04) a |= TPMS_SENSOR_PRESSURIZING;
-  if (d->statusFlags & 0x08) a |= TPMS_SENSOR_LOW_PRESSURE;
-  return a;
-}
-
 static void tpmsMacStr(const uint8_t mac[6], char *buf) {
   sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
